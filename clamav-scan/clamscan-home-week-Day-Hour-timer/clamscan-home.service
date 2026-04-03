@@ -1,5 +1,0 @@
-[Unit]
-Description=clamscan2 service
-
-[Service]
-ExecStart=/opt/auto-clamIPS/auto-clamav/clamav-scan-home.sh
