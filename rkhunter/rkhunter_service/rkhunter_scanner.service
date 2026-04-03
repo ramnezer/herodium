@@ -1,5 +1,0 @@
-[Unit]
-Description=rkhunter_scanner service
-
-[Service]
-ExecStart=/opt/auto-clamIPS/rkhunter/rkhunter_scanner.sh
