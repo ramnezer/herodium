@@ -6,7 +6,6 @@ import sys
 # ==============================================================================
 # Herodium Logger Module
 # Handles internal log rotation and formatting.
-# English comments provided for clarity.
 # ==============================================================================
 
 def setup_logger(log_file_path, level_name="INFO"):
