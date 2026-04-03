@@ -1,6 +1,0 @@
-[Unit]
-Description=notify-send service
-
-[Service]
-ExecStart=python3 /opt/auto-clamIPS/notify-clamMA/notify-send.py
-Environment="DISPLAY=:0" "XAUTHORITY=/home/[target]/.Xauthority"
