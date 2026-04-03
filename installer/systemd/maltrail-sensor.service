@@ -1,0 +1,21 @@
+[Unit]
+Description=Maltrail Sensor Only
+Documentation=https://github.com/stamparm/maltrail
+After=network.target
+
+[Service]
+User=root
+Type=simple
+# Run the sensor only
+ExecStart=/usr/bin/python3 /opt/maltrail/sensor.py
+WorkingDirectory=/opt/maltrail
+
+# Ensure directory exists before execution
+ExecStartPre=/bin/mkdir -p /var/log/maltrail
+
+# Automatic restart on failure
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

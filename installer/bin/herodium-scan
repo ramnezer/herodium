@@ -1,0 +1,35 @@
+#!/bin/bash
+
+# 1. Check if a scan is already running in the system
+if pgrep "clamdscan" > /dev/null; then
+    echo "ERROR: A scan is already running (or paused by Herodium Security Protocol)."
+    echo "Please wait for the current scan to finish before starting a new one."
+    exit 1
+fi
+
+# 2. Display welcome message
+echo "=========================================="
+echo "Herodium Secure Scanner Launched"
+echo "=========================================="
+echo "ℹNOTE: This scan works in coordination with the Live Monitor."
+echo "If a live threat is detected, this scan will PAUSE automatically."
+echo "=========================================="
+echo ""
+
+# 3. Execute the actual scan
+# Using "$@" allows the user to pass parameters like scan path
+clamdscan --multiscan --fdpass "$@"
+
+# 4. Summary
+EXIT_CODE=$?
+
+if [ $EXIT_CODE -eq 0 ]; then
+    echo ""
+    echo "Scan Completed Successfully. No viruses found."
+elif [ $EXIT_CODE -eq 1 ]; then
+    echo ""
+    echo "Scan Completed. Viruses were found!"
+else
+    echo ""
+    echo "Scan ended with an error."
+fi

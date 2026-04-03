@@ -1,0 +1,209 @@
+#!/opt/herodium/venv/bin/python3
+import curses
+import psutil
+import time
+import os
+import subprocess
+import re
+
+# Path configurations
+LOG_FILE = "/opt/herodium/logs/herodium.log"
+SERVICE_NAME = "herodium.service"
+
+
+def require_root():
+    """Require root because Herodium logs are root-only by design."""
+    if os.geteuid() != 0:
+        print("ERROR: herodium-top must be run with sudo.")
+        print("Run: sudo herodium-top")
+        raise SystemExit(1)
+
+
+def get_system_status():
+    """Check if herodium service is active."""
+    try:
+        status = subprocess.check_output(
+            ['systemctl', 'is-active', SERVICE_NAME],
+            text=True
+        ).strip()
+        return status
+    except Exception:
+        return "inactive"
+
+
+def get_cpu_temp():
+    """Fetch maximum CPU core temperature."""
+    try:
+        temps = psutil.sensors_temperatures()
+        if not temps:
+            return "N/A"
+
+        max_t = 0
+        for _, entries in temps.items():
+            for entry in entries:
+                if entry.current > max_t:
+                    max_t = entry.current
+
+        return f"{int(max_t)}°C"
+    except Exception:
+        return "N/A"
+
+
+def get_clamav_resources():
+    """Monitor ClamAV (clamd) CPU and memory usage."""
+    try:
+        for proc in psutil.process_iter(['name', 'cpu_percent', 'memory_info']):
+            name = proc.info.get('name') or ""
+            if 'clamd' in name:
+                mem_mb = proc.info['memory_info'].rss / (1024 * 1024)
+                return proc.info['cpu_percent'], mem_mb
+    except Exception:
+        pass
+
+    return 0.0, 0.0
+
+
+def get_recent_detections(limit=8):
+    """Parse the log for the latest security events."""
+    detections = []
+    if not os.path.exists(LOG_FILE):
+        return []
+
+    try:
+        tail = subprocess.check_output(['tail', '-n', '1000', LOG_FILE], text=True)
+        pattern = r'(VIRUS DETECTED|MEMORY HUNTER TRIGGERED|KILLING INFECTED PROCESS).*?: (.*)'
+        matches = re.findall(pattern, tail)
+
+        for match in matches[-limit:]:
+            clean_path = match[1].split('(')[0].strip()
+            clean_name = os.path.basename(clean_path)
+            detections.append(f"{match[0]}: {clean_name}")
+    except Exception:
+        pass
+
+    return detections
+
+
+def get_last_memory_scan_count():
+    """Extract the last 'Memory Scan: checked X processes' value from the log."""
+    try:
+        tail = subprocess.check_output(['tail', '-n', '200', LOG_FILE], text=True)
+        matches = re.findall(r'Memory Scan: checked (\d+) processes', tail)
+        if matches:
+            return matches[-1]
+    except Exception:
+        pass
+
+    return "0"
+
+
+def clear_logs():
+    """Truncate the log file to reset stats."""
+    try:
+        with open(LOG_FILE, 'w') as f:
+            f.write(
+                f"{time.strftime('%Y-%m-%d %H:%M:%S')} - [HERODIUM] - INFO - "
+                "Logs cleared by user. Stats reset.\n"
+            )
+        return True
+    except Exception:
+        return False
+
+
+def draw_dashboard(stdscr):
+    """Main curses dashboard loop."""
+    curses.curs_set(0)
+    stdscr.nodelay(True)
+    stdscr.timeout(2000)
+
+    show_cleared_msg = 0
+
+    while True:
+        stdscr.clear()
+        height, width = stdscr.getmaxyx()
+
+        # Header
+        header = "HERODIUM SECURITY REAL-TIME DASHBOARD "
+        stdscr.attron(curses.A_BOLD | curses.color_pair(1))
+        stdscr.addstr(0, max(0, (width - len(header)) // 2), header)
+        stdscr.attroff(curses.A_BOLD | curses.color_pair(1))
+        stdscr.addstr(1, 0, "—" * width)
+
+        # Status line
+        status = get_system_status()
+        stdscr.addstr(3, 2, "ENGINE: ")
+        color = curses.color_pair(2) if status == "active" else curses.color_pair(3)
+        stdscr.addstr(status.upper(), color | curses.A_BOLD)
+
+        temp = get_cpu_temp()
+        stdscr.addstr(3, 25, f"TEMP: {temp}")
+
+        cpu_usage = psutil.cpu_percent()
+        stdscr.addstr(3, 40, f"SYSTEM LOAD: {cpu_usage}%")
+
+        # Resources and stats
+        clam_cpu, clam_mem = get_clamav_resources()
+        last_scan_cnt = get_last_memory_scan_count()
+
+        stdscr.addstr(5, 2, "ANTIVIRUS ENGINE (ClamD):", curses.A_UNDERLINE)
+        stdscr.addstr(6, 4, f"• CPU: {clam_cpu}%")
+        stdscr.addstr(7, 4, f"• RAM: {clam_mem:.1f} MB")
+
+        stdscr.addstr(5, 40, "MEMORY HUNTER:", curses.A_UNDERLINE)
+        stdscr.addstr(6, 42, f"• Last Scan: {last_scan_cnt} processes")
+
+        # Threat history
+        stdscr.addstr(10, 2, "LATEST SECURITY EVENTS:", curses.A_UNDERLINE)
+
+        if show_cleared_msg > 0:
+            stdscr.addstr(11, 4, "LOGS CLEARED! Statistics reset.", curses.color_pair(2))
+            show_cleared_msg -= 1
+        else:
+            detections = get_recent_detections()
+            if not detections:
+                stdscr.addstr(11, 4, "No recent threats. Monitoring system...")
+            else:
+                for i, det in enumerate(reversed(detections)):
+                    if 11 + i < height - 2:
+                        stdscr.addstr(11 + i, 4, f"[{i+1}] {det}", curses.color_pair(3))
+
+        # Footer
+        footer = " PRESS 'C' TO CLEAR STATS | 'Q' TO EXIT | REFRESH: 2S "
+        try:
+            stdscr.addstr(
+                height - 1,
+                max(0, (width - len(footer)) // 2),
+                footer,
+                curses.A_REVERSE
+            )
+        except Exception:
+            pass
+
+        stdscr.refresh()
+
+        # Input handling
+        key = stdscr.getch()
+        if key in [ord('q'), ord('Q')]:
+            break
+        elif key in [ord('c'), ord('C')]:
+            if clear_logs():
+                show_cleared_msg = 2
+
+
+def init_curses(stdscr):
+    """Initialize curses colors and start dashboard."""
+    curses.start_color()
+    curses.init_pair(1, curses.COLOR_CYAN, curses.COLOR_BLACK)
+    curses.init_pair(2, curses.COLOR_GREEN, curses.COLOR_BLACK)
+    curses.init_pair(3, curses.COLOR_RED, curses.COLOR_BLACK)
+    draw_dashboard(stdscr)
+
+
+def main():
+    require_root()
+    os.environ.setdefault('ESCDELAY', '25')
+    curses.wrapper(init_curses)
+
+
+if __name__ == "__main__":
+    main()

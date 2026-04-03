@@ -1,0 +1,112 @@
+# ==============================================================================
+# Herodium Security System - Configuration File
+# ==============================================================================
+
+system:
+  run_as_user: "root"
+  log_file: "/var/log/herodium/herodium.log"
+  log_level: "INFO"
+
+live_monitor:
+  # Controls real-time monitoring modules (FS watcher + USB + Memory Hunter loop)
+  enable: true
+
+directories:
+  # Critical monitoring paths (avoid "/" to prevent inotify crashes)
+  watch_paths:
+    - "/home"
+    - "/tmp"
+    - "/etc"
+    - "/var/www"
+
+  quarantine_dir: "/opt/herodium/quarantine"
+
+  # Optional performance filters for live scanning
+  ignore_prefixes:
+    - "/proc"
+    - "/sys"
+    - "/dev"
+    - "/run"
+    - "/var/log"
+    - "/var/lib/clamav"
+    - "/opt/herodium/quarantine"
+    - "/snap"
+    - "/root/.maltrail"
+
+  # Optional: ignore /home/*/.cache and /root/.cache to improve performance
+  ignore_user_cache: false
+
+clamav:
+  socket_path: "/var/run/clamav/clamd.ctl"
+  max_file_size_mb: 25
+  stream_max_length_mb: 25
+  threat_action: "quarantine"
+
+# Memory Scan Configuration
+memory_scan:
+  interval_seconds: 1
+  whitelist:
+    - "chrome"
+    - "firefox"
+    - "code"
+    - "gnome-shell"
+    - "systemd"
+
+maltrail:
+  log_path: "/var/log/maltrail/detected.log"
+  block_traffic: true
+  harden_ufw: false
+  ipset_name: "herodium_blacklist"
+  # --- Anti-Trolling Whitelist ---
+  whitelist:
+    - "127.0.0.1"        # Localhost
+    - "::1"              # IPv6 Localhost
+    - "192.168.1.1"      # Router/Gateway (Example)
+    - "8.8.8.8"          # DNS (Prevent internet cutoff)
+  ping_before_block: false
+  desktop_notifications: true
+  desktop_log: true
+  clean_interval_hours: 168
+
+performance:
+  # If false, ZRAM won't be enabled by the engine (respects user choice from installer)
+  enable_zram: false
+  cpu_limit_percent: 30
+
+hardening:
+  enable: false
+  rules:
+    "net.ipv4.conf.all.rp_filter": "1"
+    "net.ipv4.conf.all.accept_redirects": "0"
+    "net.ipv4.conf.default.accept_redirects": "0"
+    "net.ipv4.icmp_echo_ignore_broadcasts": "1"
+    "net.ipv4.tcp_syncookies": "1"
+    "net.ipv4.conf.all.log_martians": "1"
+    "kernel.dmesg_restrict": "1"
+    "kernel.kptr_restrict": "1"
+
+scheduler:
+  enable: true
+  rkhunter_interval_hours: 6
+  home_scan_interval_hours: 24
+  full_scan_interval_hours: 168
+  update_interval_hours: 24
+
+ips:
+  enable: true
+  bantime: 3600
+  maxretry: 3
+  findtime: 60
+
+apparmor:
+  # Security Levels:
+  # 1 = Default (OS Defaults, no changes)
+  # 2 = Light (Install basic profiles in Complain Mode - Alerts only, no blocking)
+  # 3 = Medium (Install basic profiles in Enforce Mode - Blocks known threats)
+  # 4 = Full (Extended profiles + Auditd + Full Enforcement - Highest security, may break apps)
+  level: 2
+
+  # Create a Timeshift backup before changing profile levels (Highly recommended for levels 3-4)
+  create_backup: true
+  backup_name: "herodium_pre_apparmor_change"
+
