@@ -1,5 +1,0 @@
-[Unit]
-Description=flush_blacklists service
-
-[Service]
-ExecStart=/opt/auto-clamIPS/maltrail/flush_blacklists.sh
