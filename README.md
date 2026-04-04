@@ -318,6 +318,7 @@ To remove Herodium and clean up its installed files and service units:
 
 ```bash
 cd installer
+chmod +x uninstall.sh
 sudo ./uninstall.sh
 ```
 
