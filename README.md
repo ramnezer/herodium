@@ -114,6 +114,7 @@ The current installer flow is oriented toward:
 - Debian
 - Ubuntu
 - Linux Mint
+- Kali Linux
 
 Root privileges are required for installation and normal runtime operation.
 
