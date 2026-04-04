@@ -218,6 +218,11 @@ sudo systemctl status herodium-scheduled-scan.timer
 sudo systemctl status maltrail-sensor.service
 ```
 
+### Real-Time Logs Monitoring
+```bash
+sudo tail -f /var/log/herodium/herodium.log
+```
+
 ### Real-time dashboard
 
 ```bash
