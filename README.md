@@ -137,6 +137,7 @@ Root privileges are required for installation and normal runtime operation.
 ### Clone the repository
 
 ```bash
+sudo apt-get install git
 git clone https://github.com/ramnezer/herodium.git
 cd herodium
 ```
