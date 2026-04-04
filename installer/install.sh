@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ==============================================================================
-# HERODIUM INSTALLER V2.6 (COMPLETE WIZARD)
+# HERODIUM INSTALLER (COMPLETE WIZARD)
 # ==============================================================================
 
 # --- Variables ---
