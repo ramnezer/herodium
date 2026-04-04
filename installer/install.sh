@@ -409,8 +409,8 @@ cat >/etc/logrotate.d/herodium <<'EOF'
   notifempty
   copytruncate
 # Secure permissions for log files (Only root can read/write)
-# NOTE: 'create' is largely ignored when 'copytruncate' is used,
-# but it is set to 0600 here for safety if copytruncate is ever removed.
+#
+#
   create 0600 root root
 }
 EOF
