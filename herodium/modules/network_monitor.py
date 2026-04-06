@@ -43,7 +43,7 @@ class NetworkMonitor:
         self.running = False
 
         # Initialize the universal notifier
-        self.notifier = Notifier(config, logger)
+        self.notifier = Notifier(config, logger, scope="maltrail")
 
         # Optional scheduled cleanup of ipset blacklists (hours). 0 disables.
         try:
