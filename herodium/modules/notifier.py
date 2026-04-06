@@ -4,34 +4,67 @@ import os
 import pwd
 
 class Notifier:
-    def __init__(self, config, logger):
-        self.config = config
+    def __init__(self, config, logger, scope="general"):
+        self.config = config or {}
         self.logger = logger
-        self.enabled = self.config.get('maltrail', {}).get('desktop_notifications', True)
+        self.scope = scope
+        self.enabled = self._resolve_enabled_state()
+
+    def _resolve_enabled_state(self):
+        """
+        Resolve notification enablement by scope.
+
+        general  -> notifications.enable (default: True)
+        maltrail -> maltrail.desktop_notifications
+                    fallback to notifications.enable
+                    fallback to True
+        """
+        try:
+            notifications_cfg = (self.config.get('notifications') or {})
+            maltrail_cfg = (self.config.get('maltrail') or {})
+
+            if self.scope == "maltrail":
+                if 'desktop_notifications' in maltrail_cfg:
+                    return bool(maltrail_cfg.get('desktop_notifications'))
+                if 'enable' in notifications_cfg:
+                    return bool(notifications_cfg.get('enable'))
+                return True
+
+            if 'enable' in notifications_cfg:
+                return bool(notifications_cfg.get('enable'))
+
+            return True
+
+        except Exception:
+            return True
 
     def send_notification(self, title, message, level='normal'):
         """
-        Sends a desktop notification to all active logged-in users.
-        Uses 'env' inside sudo to bypass environment scrubbing.
+        Send a desktop notification to all active logged-in users.
+        Uses 'env' inside sudo/runuser to bypass environment scrubbing.
         """
-        if not self.enabled: return
+        if not self.enabled:
+            return
 
         try:
-            # Iterate directly over active user sessions in /run/user
             base_run_dir = '/run/user'
-            if not os.path.exists(base_run_dir): return
+            if not os.path.exists(base_run_dir):
+                return
 
             for entry in os.listdir(base_run_dir):
-                if not entry.isdigit(): continue
-                
+                if not entry.isdigit():
+                    continue
+
                 uid = int(entry)
-                if uid < 1000: continue # Skip system users
+                if uid < 1000:
+                    continue
 
                 try:
                     user_name = pwd.getpwuid(uid).pw_name
-                    
                     dbus_path = f"{base_run_dir}/{uid}/bus"
-                    if not os.path.exists(dbus_path): continue
+
+                    if not os.path.exists(dbus_path):
+                        continue
 
                     self._dispatch(user_name, uid, dbus_path, title, message, level)
 
@@ -42,7 +75,7 @@ class Notifier:
             self.logger.error(f"Notification loop error: {e}")
 
     def _dispatch(self, user, uid, dbus_path, title, message, level):
-        """Injects the notification using 'sudo -u user env VAR=VAL cmd'."""
+        """Dispatch a notification to a specific desktop session."""
         try:
             env_prefix = [
                 '/usr/bin/env',
