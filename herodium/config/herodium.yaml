@@ -7,6 +7,10 @@ system:
   log_file: "/var/log/herodium/herodium.log"
   log_level: "INFO"
 
+  # Controls notifications
+notifications:
+  enable: true
+
 live_monitor:
   # Controls real-time monitoring modules (FS watcher + USB + Memory Hunter loop)
   enable: true
@@ -109,4 +113,3 @@ apparmor:
   # Create a Timeshift backup before changing profile levels (Highly recommended for levels 3-4)
   create_backup: true
   backup_name: "herodium_pre_apparmor_change"
-
