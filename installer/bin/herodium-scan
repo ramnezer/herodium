@@ -33,3 +33,6 @@ else
     echo ""
     echo "Scan ended with an error."
 fi
+
+# Preserve clamdscan exit status for automation, scripts, and systemd.
+exit "$EXIT_CODE"
