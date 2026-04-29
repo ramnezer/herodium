@@ -23,10 +23,10 @@ clamdscan --multiscan --fdpass "$@"
 # 4. Summary
 EXIT_CODE=$?
 
-if [ $EXIT_CODE -eq 0 ]; then
+if [ "$EXIT_CODE" -eq 0 ]; then
     echo ""
     echo "Scan Completed Successfully. No viruses found."
-elif [ $EXIT_CODE -eq 1 ]; then
+elif [ "$EXIT_CODE" -eq 1 ]; then
     echo ""
     echo "Scan Completed. Viruses were found!"
 else
