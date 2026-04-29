@@ -545,7 +545,7 @@ cat >/usr/local/bin/herodium_scheduled_scan.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
-# English comments only
+#
 LOGDIR="/var/log/herodium"
 LOGFILE="${LOGDIR}/scheduled_scan.log"
 mkdir -p "${LOGDIR}"
