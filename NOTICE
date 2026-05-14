@@ -2,8 +2,17 @@ Herodium
 
 Copyright (c) 2022–2026 Ram Nezer
 
-Herodium is licensed under the GNU Lesser General Public License v3.0
-or later, unless otherwise stated.
+Herodium is licensed under the MIT License, unless otherwise stated.
 
 Original author and maintainer:
 Ram Nezer
+
+External system dependencies
+----------------------------
+
+Herodium may install or integrate with external system packages such as:
+ClamAV, Fail2Ban, Rkhunter, Timeshift, AppArmor, iptables/ipset, systemd,
+zram-tools, logrotate, and Maltrail.
+
+These tools are not part of Herodium's source code and remain licensed
+under their own respective licenses.
