@@ -1,11 +1,12 @@
 # Herodium Security System (Dev Edition)
 
-> [!CAUTION]
-> **DEVELOPER USE ONLY**
-> **This software is intended exclusively for developers and security researchers.**
-> It is designed as a **seed/foundation** framework for building broader security tools.
-> **DO NOT** deploy this tool in a production, business, or daily-driver personal environment without extensive testing in a dedicated development environment (sandbox/VM).
-> This system makes significant changes to the OS kernel, network stack (IPTables/IPSet), and background services. Improper configuration or conflicts with existing software may lead to system instability or data inaccessibility. **Use at your own risk.**
+> [!IMPORTANT]
+> Herodium is a developer-oriented Linux security framework for testing, research, and controlled deployments.
+>
+> It works with system-level components such as ClamAV, AppArmor, Fail2Ban, Maltrail, ZRAM, systemd, and iptables/ipset.
+> Test it in a VM, sandbox, or non-critical system before using it on a daily-driver or production machine.
+>
+> Herodium is a flexible foundation. Review and tune the configuration for your own system.
 
 ---
 
