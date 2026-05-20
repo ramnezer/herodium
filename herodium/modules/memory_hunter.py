@@ -12,6 +12,10 @@ class MemoryHunter:
 
         cfg = (config.get('memory_scan', {}) or {})
         raw_whitelist = cfg.get('whitelist', []) or []
+        self.kill_infected_process = self._safe_bool(
+            cfg.get('kill_infected_process'),
+            True
+        )
 
         self.whitelist_names = set()
         self.whitelist_paths = set()
@@ -44,6 +48,20 @@ class MemoryHunter:
         })
 
         self.scanned_cache = {}
+
+    def _safe_bool(self, value, default):
+        """Return a safe boolean value from YAML/user configuration."""
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return default
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in ('1', 'true', 'yes', 'on'):
+                return True
+            if normalized in ('0', 'false', 'no', 'off'):
+                return False
+        return default
 
     def _is_whitelisted_process(self, name, exe_path):
         """
@@ -106,13 +124,21 @@ class MemoryHunter:
 
                     # 4. Perform scan
                     infected = False
+                    process_removed = False
                     for file_path in files_to_scan:
                         if self.scanner.scan_file(file_path):
-                            self._kill_process(proc, file_path)
                             infected = True
+                            if self._should_kill_infected_process():
+                                self._kill_process(proc, file_path)
+                                process_removed = True
+                            else:
+                                self.logger.warning(
+                                    f"Infected process detected but left running by policy: "
+                                    f"{name} (PID: {pid})"
+                                )
                             break
 
-                    if not infected:
+                    if not infected or not process_removed:
                         self.scanned_cache[pid] = start_time
                         scanned_count += 1
 
@@ -125,6 +151,23 @@ class MemoryHunter:
 
         if scanned_count > 0:
             self.logger.info(f"Memory Scan: checked {scanned_count} processes")
+
+    def _should_kill_infected_process(self):
+        """
+        Decide whether Memory Hunter is allowed to terminate a process.
+        Alert-only ClamAV policy must never kill processes.
+        """
+        try:
+            if not self.kill_infected_process:
+                return False
+
+            action_policy = str(getattr(self.scanner, 'action_policy', '') or '').lower()
+            if action_policy == 'alert':
+                return False
+
+            return True
+        except Exception:
+            return False
 
     def _kill_process(self, proc, reason_file):
         try:
