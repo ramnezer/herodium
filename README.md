@@ -55,7 +55,7 @@ Herodium currently focuses on these areas:
 - Supports scheduled blacklist cleanup.
 
 ### System Hardening and Host Controls
-- AppArmor profile handling with multiple levels.
+- AppArmor profile handling with multiple levels, defaulting to OS behavior unless explicitly changed.
 - Optional `sysctl` hardening rules.
 - Optional ZRAM activation.
 - Dynamic ClamAV resource throttling based on workload and thermal conditions.
@@ -308,7 +308,7 @@ Out of the box, the current default configuration includes:
 - optional network blocking controlled by configuration
 - optional hardening controlled by configuration
 - AppArmor default level:
-  - `2`
+  - `1` — OS default / no Herodium AppArmor changes
 
 ## Logs
 
