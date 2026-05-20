@@ -128,20 +128,21 @@ class AppArmorManager:
 
     def _restore_baseline_mode_state(self):
         """
-        Restore the original complain-mode markers and reload AppArmor.
-        If baseline is missing, fall back to generic defaults.
+        Restore the original complain-mode markers only when Herodium saved
+        a baseline. If no Herodium baseline exists, leave the system unchanged.
         """
         try:
+            if not os.path.isdir(self.baseline_force_complain):
+                self.logger.info(
+                    "No Herodium AppArmor baseline found; leaving force-complain state unchanged."
+                )
+                return
+
             if os.path.isdir(self.force_complain_dir):
                 shutil.rmtree(self.force_complain_dir, ignore_errors=True)
 
-            if os.path.isdir(self.baseline_force_complain):
-                shutil.copytree(self.baseline_force_complain, self.force_complain_dir, symlinks=True)
-                self.logger.info("Restored AppArmor baseline mode state.")
-            else:
-                os.makedirs(self.force_complain_dir, exist_ok=True)
-                self.logger.warning("Baseline AppArmor state was missing. Restored generic defaults instead.")
-
+            shutil.copytree(self.baseline_force_complain, self.force_complain_dir, symlinks=True)
+            self.logger.info("Restored AppArmor baseline mode state.")
             self._reload_apparmor()
         except Exception as e:
             self.logger.warning(f"Failed to restore AppArmor baseline state: {e}")
@@ -151,8 +152,8 @@ class AppArmorManager:
         Run Timeshift synchronously so policy changes start only after backup completion.
         """
         if not shutil.which('timeshift'):
-            self.logger.warning("Timeshift not found. Continuing AppArmor change without backup.")
-            return True
+            self.logger.warning("Timeshift not found. Skipping AppArmor policy change because backup was requested.")
+            return False
 
         self.logger.info("Creating Timeshift snapshot before AppArmor change...")
         try:
@@ -199,14 +200,7 @@ class AppArmorManager:
 
     def _mode_default(self):
         self._restore_baseline_mode_state()
-
-        # Best-effort rollback of Level 4 audit component
-        subprocess.run(
-            ['systemctl', 'disable', '--now', 'auditd'],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False
-        )
+        self.logger.info("AppArmor Level 1 selected; auditd service state left unchanged.")
 
     def _mode_light(self):
         profiles = self._profile_paths()
