@@ -3,6 +3,7 @@ import threading
 import subprocess
 import logging
 import os
+import re
 from modules.notifier import Notifier
 
 class TaskScheduler:
@@ -91,6 +92,25 @@ class TaskScheduler:
         qdir = str(dirs_cfg.get('quarantine_dir') or '/opt/herodium/quarantine')
 
         cmd = ['clamdscan', '--fdpass', '--multiscan']
+
+        # Keep legacy engine scans aligned with the systemd scheduled scan safety policy.
+        # Avoid pseudo-filesystems, scanner databases, and Herodium-owned output paths.
+        safe_exclude_dirs = [
+            "/proc",
+            "/sys",
+            "/dev",
+            "/run",
+            "/var/lib/clamav",
+            qdir,
+            "/var/log/herodium",
+            "/root/.maltrail",
+        ]
+
+        for excluded_dir in safe_exclude_dirs:
+            normalized_dir = str(excluded_dir).rstrip("/")
+            if not normalized_dir:
+                continue
+            cmd.append(f"--exclude-dir=^{re.escape(normalized_dir)}($|/)")
 
         # Apply user policy for scheduled scans (minimal, safe change)
         if action == 'delete':
