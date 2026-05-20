@@ -59,12 +59,18 @@ class NetworkMonitor:
         self.running = True
         self._refresh_critical_infrastructure()
 
-        # Initialize IP Sets regardless of mode (needed for detection logic)
-        subprocess.run(['ipset', 'create', self.ipset_v4, 'hash:ip', 'family', 'inet', '-exist'], check=False)
-        subprocess.run(['ipset', 'create', self.ipset_v6, 'hash:ip', 'family', 'inet6', '-exist'], check=False)
-
-        # Apply firewall rules ONLY if blocking is enabled
         if self.blocking_enabled:
+            # Blocking mode is explicitly enabled by the installer/config.
+            # Only in this mode Herodium creates ipsets and firewall rules.
+            subprocess.run(
+                ['ipset', 'create', self.ipset_v4, 'hash:ip', 'family', 'inet', '-exist'],
+                check=False
+            )
+            subprocess.run(
+                ['ipset', 'create', self.ipset_v6, 'hash:ip', 'family', 'inet6', '-exist'],
+                check=False
+            )
+
             has_ip6tables = shutil.which('ip6tables') is not None
 
             for chain in ["INPUT", "OUTPUT"]:
@@ -84,12 +90,12 @@ class NetworkMonitor:
                 f"Network Monitor Active (BLOCKING MODE). Protected IPs: {len(self.static_whitelist) + len(self.dynamic_whitelist)}"
             )
         else:
-            self.logger.info("Network Monitor Active (ALERT ONLY). No blocking rules applied.")
+            self.logger.info("Network Monitor Active (ALERT ONLY). No ipset or firewall changes applied.")
 
         threading.Thread(target=self._infrastructure_updater, daemon=True).start()
         threading.Thread(target=self._tail_loop, daemon=True).start()
 
-        # Start periodic blacklist cleanup (flush ipset) if enabled
+        # Start periodic blacklist cleanup only when blocking is enabled.
         if self.blocking_enabled and self.clean_interval_hours > 0:
             self.logger.info(f"IPSet cleanup enabled: every {self.clean_interval_hours} hour(s)")
             threading.Thread(target=self._clean_ipset_loop, daemon=True).start()
