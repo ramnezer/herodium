@@ -9,7 +9,7 @@ class IPSManager:
     def __init__(self, config, logger):
         self.config = config
         self.logger = logger
-        self.enabled = self.config.get('ips', {}).get('enable', True)
+        self.enabled = self.config.get('ips', {}).get('enable', False)
 
         self.bantime = self.config.get('ips', {}).get('bantime', 3600)
         self.maxretry = self.config.get('ips', {}).get('maxretry', 3)
