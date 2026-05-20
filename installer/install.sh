@@ -23,7 +23,7 @@ CLAM_SCAN_TYPE="HOME"
 CLAM_FREQ="weekly"
 THREAT_ACTION="quarantine"
 SCHED_THREAT_ACTION="quarantine"
-APPARMOR_LEVEL="2"
+APPARMOR_LEVEL="1"
 # --- Runtime status for final summary ---
 SNAPSHOT_STATUS="Skipped"
 ZRAM_STATUS="Disabled"
@@ -230,9 +230,9 @@ ask_system_hardening() {
     # 6.1 AppArmor
     APPARMOR_LEVEL=$(whiptail --title "Step 6: AppArmor Level" --menu "Select AppArmor Strictness:" 15 70 4 \
         "1" "Default (OS Default)" \
-        "2" "Light (Complain Mode - Logging only)" \
+        "2" "Light/Test (Complain Mode - may reduce existing enforcement)" \
         "3" "Medium (Enforce - Blocks known threats)" \
-        "4" "Strong (Full Audit - May break apps)" 3>&1 1>&2 2>&3) || APPARMOR_LEVEL="2"
+        "4" "Strong (Full Audit - May break apps)" 3>&1 1>&2 2>&3) || APPARMOR_LEVEL="1"
 
     if [[ "$APPARMOR_LEVEL" -ge 3 ]]; then
         if (whiptail --yesno "High security level selected.\nCreate another specific backup before applying AppArmor rules?" 10 60); then
@@ -282,6 +282,41 @@ EOF
     fi
 }
 
+
+remove_herodium_firewall_state() {
+    echo "[INFO] Removing old Herodium firewall/ipset state (non-blocking mode)..."
+
+    remove_herodium_iptables_rule() {
+        local bin="$1"
+        local chain="$2"
+        shift 2
+
+        if command -v "${bin}" >/dev/null 2>&1; then
+            while "${bin}" -C "${chain}" "$@" 2>/dev/null; do
+                "${bin}" -D "${chain}" "$@" 2>/dev/null || break
+            done
+        fi
+    }
+
+    # IPv4 rules created by Herodium blocking mode
+    remove_herodium_iptables_rule iptables INPUT  -m set --match-set herodium_blacklist dst -j DROP
+    remove_herodium_iptables_rule iptables INPUT  -m set --match-set herodium_blacklist src -j DROP
+    remove_herodium_iptables_rule iptables OUTPUT -m set --match-set herodium_blacklist dst -j DROP
+    remove_herodium_iptables_rule iptables OUTPUT -m set --match-set herodium_blacklist src -j DROP
+
+    # IPv6 rules created by Herodium blocking mode
+    remove_herodium_iptables_rule ip6tables INPUT  -m set --match-set herodium_blacklist_v6 dst -j DROP
+    remove_herodium_iptables_rule ip6tables INPUT  -m set --match-set herodium_blacklist_v6 src -j DROP
+    remove_herodium_iptables_rule ip6tables OUTPUT -m set --match-set herodium_blacklist_v6 dst -j DROP
+    remove_herodium_iptables_rule ip6tables OUTPUT -m set --match-set herodium_blacklist_v6 src -j DROP
+
+    if command -v ipset >/dev/null 2>&1; then
+        ipset destroy herodium_blacklist 2>/dev/null || true
+        ipset destroy herodium_blacklist_v6 2>/dev/null || true
+    fi
+}
+
+
 # ==============================================================================
 # MAIN INSTALLATION LOGIC
 # ==============================================================================
@@ -313,6 +348,12 @@ fi
 
 # 3. Fail2Ban Installation (Now conditional)
 setup_fail2ban_ddos
+
+# Remove stale Herodium blocking rules when the current install is not BLOCK mode.
+# This must run after the wizard choices are known and after iptables/ipset are installed.
+if [[ "${INSTALL_MALTRAIL}" != "true" || "${MALTRAIL_ACTION}" != "block" ]]; then
+    remove_herodium_firewall_state
+fi
 
 # 4. FIX AND CONFIGURE CLAMAV
 echo "[INFO] Configuring ClamAV socket and database..."
@@ -568,17 +609,30 @@ fi
 
 echo "[INFO] Starting scan: target=${SCAN_TARGET} action=${ACTION}"
 
+# Avoid scanning pseudo-filesystems, scanner databases, and Herodium-owned output paths.
+# These paths can create noise, wasted work, permission issues, or recursive scanning.
+CLAMDSCAN_EXCLUDES=(
+  "--exclude-dir=^/proc($|/)"
+  "--exclude-dir=^/sys($|/)"
+  "--exclude-dir=^/dev($|/)"
+  "--exclude-dir=^/run($|/)"
+  "--exclude-dir=^/var/lib/clamav($|/)"
+  "--exclude-dir=^/opt/herodium/quarantine($|/)"
+  "--exclude-dir=^/var/log/herodium($|/)"
+  "--exclude-dir=^/root/.maltrail($|/)"
+)
+
 case "${ACTION}" in
   delete)
-    clamdscan --fdpass --multiscan --remove=yes -- "${SCAN_TARGET}"
+    clamdscan --fdpass --multiscan "${CLAMDSCAN_EXCLUDES[@]}" --remove=yes -- "${SCAN_TARGET}"
     ;;
   quarantine)
     mkdir -p "${QDIR}"
     chmod 700 "${QDIR}" || true
-    clamdscan --fdpass --multiscan --move="${QDIR}" -- "${SCAN_TARGET}"
+    clamdscan --fdpass --multiscan "${CLAMDSCAN_EXCLUDES[@]}" --move="${QDIR}" -- "${SCAN_TARGET}"
     ;;
   alert|*)
-    clamdscan --fdpass --multiscan -- "${SCAN_TARGET}"
+    clamdscan --fdpass --multiscan "${CLAMDSCAN_EXCLUDES[@]}" -- "${SCAN_TARGET}"
     ;;
 esac
 
@@ -658,4 +712,3 @@ if [[ "${INSTALL_RKHUNTER}" == "true" ]]; then
 fi
 
 whiptail --msgbox "Installation Complete!\n\n- Snapshot: ${SNAPSHOT_STATUS}\n- ZRAM: ${ZRAM_STATUS}\n- ClamAV: ${CLAMAV_SUMMARY}\n- Maltrail: ${MALTRAIL_SUMMARY}\n- Rkhunter: ${RKHUNTER_SUMMARY}\n- Fail2Ban: ${INSTALL_FAIL2BAN}\n- AppArmor: Level ${APPARMOR_LEVEL}\n\nRun 'sudo herodium-top' to monitor." 18 78
-
