@@ -49,6 +49,9 @@ clamav:
 # Memory Scan Configuration
 memory_scan:
   interval_seconds: 1
+  # If false, Memory Hunter will alert/log detections but will not terminate processes.
+  # Also forced off automatically when clamav.threat_action is "alert".
+  kill_infected_process: true
   whitelist:
     - "chrome"
     - "firefox"
@@ -57,8 +60,9 @@ memory_scan:
     - "systemd"
 
 maltrail:
+  enable: false
   log_path: "/var/log/maltrail/detected.log"
-  block_traffic: true
+  block_traffic: false
   harden_ufw: false
   ipset_name: "herodium_blacklist"
   # --- Anti-Trolling Whitelist ---
@@ -97,19 +101,19 @@ scheduler:
   update_interval_hours: 24
 
 ips:
-  enable: true
+  enable: false
   bantime: 3600
   maxretry: 3
   findtime: 60
 
 apparmor:
   # Security Levels:
-  # 1 = Default (OS Defaults, no changes)
-  # 2 = Light (Install basic profiles in Complain Mode - Alerts only, no blocking)
+  # 1 = Default (OS Defaults, no Herodium AppArmor changes)
+  # 2 = Light/Test (Complain Mode - logs only; may reduce existing enforcement)
   # 3 = Medium (Install basic profiles in Enforce Mode - Blocks known threats)
   # 4 = Full (Extended profiles + Auditd + Full Enforcement - Highest security, may break apps)
-  level: 2
+  level: 1
 
-  # Create a Timeshift backup before changing profile levels (Highly recommended for levels 3-4)
+  # Create a Timeshift backup before changing profile levels (Highly recommended for levels 2-4)
   create_backup: true
   backup_name: "herodium_pre_apparmor_change"
