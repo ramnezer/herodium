@@ -56,10 +56,11 @@ remove_iptables_rule() {
     local bin="$1"
     local chain="$2"
     shift 2
+
     if command -v "${bin}" &>/dev/null; then
-        if "${bin}" -C "${chain}" "$@" 2>/dev/null; then
-            "${bin}" -D "${chain}" "$@" 2>/dev/null || true
-        fi
+        while "${bin}" -C "${chain}" "$@" 2>/dev/null; do
+            "${bin}" -D "${chain}" "$@" 2>/dev/null || break
+        done
     fi
 }
 
@@ -92,29 +93,40 @@ systemctl daemon-reload
 # 3. Remove Files and Directories
 echo "[3/6] Cleaning up files..."
 
-# Best-effort restore of AppArmor baseline state before deleting Herodium files
-if [[ -d /opt/herodium/apparmor_state_data/baseline_force-complain || -d /etc/apparmor.d/force-complain ]]; then
+# Best-effort restore of AppArmor baseline state before deleting Herodium files.
+# Only restore when Herodium saved a baseline. Do not modify a system/user-owned
+# /etc/apparmor.d/force-complain directory just because it exists.
+APPARMOR_BASELINE_DIR="${APP_DIR}/apparmor_state_data/baseline_force-complain"
+
+if [[ -d "${APPARMOR_BASELINE_DIR}" ]]; then
     echo " -> Restoring AppArmor baseline mode state..."
 
     rm -rf /etc/apparmor.d/force-complain 2>/dev/null || true
-
-    if [[ -d /opt/herodium/apparmor_state_data/baseline_force-complain ]]; then
-        cp -a /opt/herodium/apparmor_state_data/baseline_force-complain /etc/apparmor.d/force-complain
-    else
-        mkdir -p /etc/apparmor.d/force-complain
-    fi
+    cp -a "${APPARMOR_BASELINE_DIR}" /etc/apparmor.d/force-complain
 
     systemctl reload-or-restart apparmor 2>/dev/null || true
-    systemctl disable --now auditd 2>/dev/null || true
+    echo " -> Leaving auditd service state unchanged."
+else
+    echo " -> No Herodium AppArmor baseline found; leaving AppArmor force-complain state unchanged."
 fi
 
 rm -rf "${APP_DIR}"
-rm -rf "${MALTRAIL_DIR}"
 rm -rf "${LOG_DIR}"
-rm -rf "${MALTRAIL_LOG_DIR}"
-rm -rf "/etc/maltrail"
 rm -f /etc/logrotate.d/herodium
 rm -rf "/etc/herodium"
+
+# Maltrail may have existed before Herodium.
+# Do not remove external Maltrail files unless the user explicitly chooses to.
+if [[ -d "${MALTRAIL_DIR}" || -d "${MALTRAIL_LOG_DIR}" || -d "/etc/maltrail" ]]; then
+    if (whiptail --title "Remove Maltrail files?" --yesno "Maltrail files/directories were found:\n\n- ${MALTRAIL_DIR}\n- ${MALTRAIL_LOG_DIR}\n- /etc/maltrail\n\nRemove them as part of Herodium uninstall?\n\nChoose NO if Maltrail existed before Herodium or you are not sure." 16 74); then
+        rm -rf "${MALTRAIL_DIR}"
+        rm -rf "${MALTRAIL_LOG_DIR}"
+        rm -rf "/etc/maltrail"
+        echo " -> Maltrail files removed."
+    else
+        echo " -> Keeping Maltrail files/directories."
+    fi
+fi
 
 # Remove Binaries/Scripts
 rm -f /usr/local/bin/herodium-scan
