@@ -69,7 +69,14 @@ class HerodiumEngine:
 
     def _load_config(self):
         try:
-            with open(CONFIG_PATH, 'r') as f: return yaml.safe_load(f)
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                loaded_config = yaml.safe_load(f) or {}
+
+            if not isinstance(loaded_config, dict):
+                self.logger.error("Config load failed: root YAML object must be a mapping.")
+                return {}
+
+            return loaded_config
         except Exception as e:
             self.logger.error(f"Config load failed: {e}")
             return {}
