@@ -131,6 +131,66 @@ Root privileges are required for installation and normal runtime operation.
   - **4 CPU cores**
   - **8 GB RAM**
 
+## Optional Performance and Power Optimization
+
+Herodium can optionally be used together with
+[`auto-cpufreq`](https://github.com/AdnanHodzic/auto-cpufreq) on physical
+systems.
+
+Although `auto-cpufreq` was designed primarily for laptops, practical testing
+with Herodium on a physical workstation showed improved power and thermal
+efficiency without a noticeable reduction in Herodium performance.
+
+`auto-cpufreq` dynamically manages CPU frequency scaling, governors, and turbo
+boost according to system load, CPU temperature, and power state. This can
+complement Herodium's own targeted ClamAV resource controls, particularly on
+laptops and workstations where lower power consumption, reduced heat, and
+quieter operation are desirable.
+
+This integration is optional and is not a Herodium dependency. Results may vary
+depending on:
+
+- CPU model and scaling driver
+- CPU governor configuration
+- cooling capacity
+- battery or AC power state
+- scan size and workload intensity
+- other power-management services
+
+Avoid running multiple tools that manage the same CPU frequency or power
+settings unless they have been configured specifically to coexist. In
+particular, check for potential conflicts with tools or services such as TLP,
+`power-profiles-daemon`, or other governor-management utilities.
+
+### Install auto-cpufreq
+
+Clone the official repository and run its installer:
+
+```bash
+git clone https://github.com/AdnanHodzic/auto-cpufreq.git
+cd auto-cpufreq
+sudo ./auto-cpufreq-installer
+```
+
+Install and enable the persistent `auto-cpufreq` daemon:
+
+```bash
+sudo auto-cpufreq --install
+```
+
+Review the current CPU, temperature, governor, and power-management status:
+
+```bash
+sudo auto-cpufreq --stats
+```
+
+For production or long-running Herodium deployments, compare scan completion
+times, CPU temperature, system responsiveness, and queue behavior before and
+after enabling `auto-cpufreq`.
+
+##
+##
+##
 ## Installation
 
 ### Prerequisites
