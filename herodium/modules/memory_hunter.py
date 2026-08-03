@@ -1,8 +1,8 @@
-import psutil
-import logging
-import time
 import os
-from modules.av_scanner import ClamAVScanner
+
+import psutil
+
+from modules.av_scanner import ClamAVScanner, ScanStatus
 
 
 class MemoryHunter:
@@ -88,7 +88,9 @@ class MemoryHunter:
     def flash_scan(self):
         """Smart memory scan: checks EXE binary and command-line file arguments."""
         scanned_count = 0
+        retry_pending_count = 0
         current_pids = set()
+        iteration_completed = True
 
         try:
             attrs = ['pid', 'name', 'exe', 'cmdline', 'create_time']
@@ -125,11 +127,28 @@ class MemoryHunter:
                     # 4. Perform scan
                     infected = False
                     process_removed = False
-                    for file_path in files_to_scan:
-                        if self.scanner.scan_file(file_path):
+                    retry_required = False
+                    scanner_unavailable = False
+
+                    for file_path in sorted(files_to_scan):
+                        scan_result = self.scanner.scan_file(file_path)
+
+                        if scan_result.retryable:
+                            retry_required = True
+                            scanner_unavailable = (
+                                scan_result.status is ScanStatus.UNAVAILABLE
+                            )
+                            break
+
+                        if scan_result.status is ScanStatus.INFECTED:
                             infected = True
                             if self._should_kill_infected_process():
-                                self._kill_process(proc, file_path)
+                                self._kill_process(
+                                    proc,
+                                    file_path,
+                                    pid=pid,
+                                    name=name,
+                                )
                                 process_removed = True
                             else:
                                 self.logger.warning(
@@ -138,6 +157,16 @@ class MemoryHunter:
                                 )
                             break
 
+                    if retry_required:
+                        self.scanned_cache.pop(pid, None)
+                        retry_pending_count += 1
+
+                        if scanner_unavailable:
+                            iteration_completed = False
+                            break
+
+                        continue
+
                     if not infected or not process_removed:
                         self.scanned_cache[pid] = start_time
                         scanned_count += 1
@@ -145,12 +174,19 @@ class MemoryHunter:
                 except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
                     continue
         except Exception as e:
+            iteration_completed = False
             self.logger.error(f"Memory Scan Loop Error: {e}")
 
-        self._cleanup_cache(current_pids)
+        if iteration_completed:
+            self._cleanup_cache(current_pids)
 
         if scanned_count > 0:
             self.logger.info(f"Memory Scan: checked {scanned_count} processes")
+
+        if retry_pending_count > 0:
+            self.logger.warning(
+                f"Memory Scan: {retry_pending_count} process(es) pending retry"
+            )
 
     def _should_kill_infected_process(self):
         """
@@ -169,11 +205,20 @@ class MemoryHunter:
         except Exception:
             return False
 
-    def _kill_process(self, proc, reason_file):
+    def _kill_process(self, proc, reason_file, *, pid, name):
+        """Terminate a process using identity captured before the AV scan.
+
+        psutil caches Process objects globally and concurrent process_iter()
+        calls can replace ``proc.info`` with a different attribute set. The AV
+        scan can take long enough for that to happen, so the immutable PID and
+        name captured by flash_scan() must be used here instead of consulting
+        proc.info again.
+        """
         try:
-            pid = proc.info['pid']
-            name = proc.info['name']
-            self.logger.critical(f"KILLING INFECTED PROCESS: {name} (PID: {pid})")
+            display_name = name or "<unknown>"
+            self.logger.critical(
+                f"KILLING INFECTED PROCESS: {display_name} (PID: {pid})"
+            )
             self.logger.critical(f"   -> Reason: Loaded infected file {reason_file}")
 
             proc.terminate()
@@ -181,13 +226,14 @@ class MemoryHunter:
                 proc.wait(timeout=2)
             except psutil.TimeoutExpired:
                 proc.kill()
-        except Exception:
-            pass
+        except (psutil.NoSuchProcess, psutil.AccessDenied) as e:
+            self.logger.warning(f"Unable to terminate infected process: {e}")
+        except Exception as e:
+            self.logger.error(f"Unexpected process termination error: {e}")
 
     def _cleanup_cache(self, current_pids_set):
-        try:
-            expired_pids = [pid for pid in self.scanned_cache if pid not in current_pids_set]
-            for pid in expired_pids:
-                del self.scanned_cache[pid]
-        except Exception:
-            pass
+        expired_pids = [
+            pid for pid in self.scanned_cache if pid not in current_pids_set
+        ]
+        for pid in expired_pids:
+            del self.scanned_cache[pid]
