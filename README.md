@@ -64,7 +64,8 @@ Herodium currently focuses on these areas:
 
 ### Scheduled Tasks
 - Supports scheduled ClamAV scanning.
-- Supports optional Rkhunter checks and updates.
+- Supports optional Rkhunter checks and threat-data updates.
+- Never updates the local Rkhunter file-properties baseline automatically.
 - The installer configures scheduled ClamAV scans through systemd timer units.
 
 ## Project Structure
@@ -75,11 +76,15 @@ Herodium currently focuses on these areas:
 │   ├── config/
 │   │   └── herodium.yaml
 │   ├── core/
+│   │   ├── __init__.py
 │   │   ├── engine.py
+│   │   ├── health.py
 │   │   ├── logger.py
-│   │   └── __init__.py
+│   │   └── system_command.py
 │   ├── modules/
+│   │   ├── __init__.py
 │   │   ├── apparmor_manager.py
+│   │   ├── apparmor_state.py
 │   │   ├── av_scanner.py
 │   │   ├── fs_monitor.py
 │   │   ├── ips_manager.py
@@ -87,20 +92,50 @@ Herodium currently focuses on these areas:
 │   │   ├── network_monitor.py
 │   │   ├── notifier.py
 │   │   ├── performance_manager.py
+│   │   ├── rkhunter_manager.py
+│   │   ├── scan_recovery.py
 │   │   ├── scheduler.py
 │   │   ├── sys_hardener.py
-│   │   ├── zram_manager.py
-│   │   └── __init__.py
+│   │   └── zram_manager.py
+│   ├── requirements.lock
 │   └── requirements.txt
-└── installer/
-    ├── bin/
-    │   ├── herodium-scan
-    │   └── herodium-top
-    ├── systemd/
-    │   ├── herodium.service
-    │   └── maltrail-sensor.service
-    ├── install.sh
-    └── uninstall.sh
+├── installer/
+│   ├── bin/
+│   │   ├── herodium-rkhunter-baseline
+│   │   ├── herodium-scan
+│   │   └── herodium-top
+│   ├── systemd/
+│   │   ├── herodium.service
+│   │   └── maltrail-sensor.service
+│   ├── install.sh
+│   ├── python-tools.lock
+│   ├── supply-chain-lock.json
+│   └── uninstall.sh
+└── tests/
+    ├── test_apparmor_installer_contract.py
+    ├── test_apparmor_manager.py
+    ├── test_apparmor_state.py
+    ├── test_av_scanner.py
+    ├── test_clamav_installer_contract.py
+    ├── test_engine_health.py
+    ├── test_fs_monitor.py
+    ├── test_health.py
+    ├── test_herodium_top.py
+    ├── test_installer_reliability_contract.py
+    ├── test_ips_manager.py
+    ├── test_memory_hunter.py
+    ├── test_network_monitor.py
+    ├── test_notifier.py
+    ├── test_performance_manager.py
+    ├── test_rkhunter_baseline_contract.py
+    ├── test_rkhunter_manager.py
+    ├── test_scan_recovery.py
+    ├── test_scheduler.py
+    ├── test_staged_deployment_installer_contract.py
+    ├── test_supply_chain_installer_contract.py
+    ├── test_sys_hardener.py
+    ├── test_system_command.py
+    └── test_zram_manager.py
 ```
 
 ## Supported Environment
@@ -210,10 +245,12 @@ cd herodium
 ### Run the installer
 
 ```bash
-cd installer
-chmod +x install.sh
-sudo ./install.sh
+sudo bash installer/install.sh
 ```
+
+The source scripts intentionally remain non-executable. Invoke them through
+`sudo bash` so archive extraction and source-control mode changes cannot alter
+the documented installation path.
 
 ### Installer flow
 
@@ -239,6 +276,8 @@ Depending on your selections, the installer may configure:
   - `herodium.service`
 - optional Maltrail sensor service:
   - `maltrail-sensor.service`
+  - code pinned by `installer/supply-chain-lock.json`
+  - upstream feed downloads disabled by default (`--offline`)
 - scheduled ClamAV scan service and timer:
   - `herodium-scheduled-scan.service`
   - `herodium-scheduled-scan.timer`
@@ -246,6 +285,83 @@ Depending on your selections, the installer may configure:
   - `/var/log/herodium`
 - scheduled scan config under:
   - `/etc/herodium/scheduled_scan.conf`
+
+## Herodium Deployment and Dependency Policy
+
+Herodium itself is built under `/opt/herodium.stage` while the currently active
+service continues using `/opt/herodium`. The installer creates a stable source
+manifest, copies only regular source files into the root-owned stage, and
+verifies that both the source and staged snapshot match before dependency work
+begins.
+
+The staged virtual environment is new for every installation. Packaging tools
+are pinned with SHA-256 hashes in `installer/python-tools.lock`; runtime
+packages are pinned with SHA-256 hashes in `herodium/requirements.lock`. Pip is
+run in isolated mode with user and system configuration disabled,
+`--require-hashes`, `--no-deps`, and the explicit PyPI simple index. The active
+`/opt/herodium/venv` is never upgraded in place.
+
+Before activation, the installer validates the exact installed distribution
+set, imports, Python syntax, YAML configuration, `pip check`, permissions, and
+a content manifest. Existing root-owned configuration is preserved and updated
+inside the stage. Mutable quarantine contents are copied only after the old
+service has been stopped.
+
+Activation rotates `/opt/herodium` to `/opt/herodium.previous` and renames the
+fully validated stage into place. The new service must reach Herodium's
+`PROTECTED` health state before the transaction can be committed. A failure or
+interrupt before commit restores the previous deployment, service unit,
+enabled state, and active state automatically. The validated deployment
+manifest is retained under `/var/lib/herodium/supply-chain` for operator audit.
+
+## Maltrail Supply-Chain Policy
+
+Herodium does not install Maltrail from a moving branch. The installer reads an
+immutable upstream repository, full commit identifier, and expected license
+SHA-256 from `installer/supply-chain-lock.json`. It fetches only that commit,
+validates the fetched object database, checks the license hash, extracts a
+content-only deployment, and activates it only after the service passes a
+health check. The prior `/opt/maltrail` deployment is retained as
+`/opt/maltrail.previous` for immediate rollback.
+
+The sensor starts with `--offline` and uses an explicit root-owned configuration
+at `/etc/maltrail/maltrail.conf`. Runtime trail state is isolated under a path
+that contains the pinned commit, preventing earlier online feed state from
+silently influencing the deterministic deployment. Live feed updates are not
+part of the default installer path because remote feed contents are not pinned
+by the Herodium release.
+
+## Rkhunter Baseline Safety
+
+Herodium runs scheduled Rkhunter checks and may update Rkhunter threat-data files,
+but it never runs `rkhunter --propupd` automatically. The file-properties
+baseline represents trusted local system state and must only be changed after an
+operator has investigated the current warnings and verified that the changes are
+authorized.
+
+Review the current warnings without changing the baseline:
+
+```bash
+sudo herodium-rkhunter-baseline --review
+```
+
+After investigating and validating all relevant changes, perform an explicit,
+audited baseline update:
+
+```bash
+sudo herodium-rkhunter-baseline \
+  --update \
+  --acknowledge-reviewed-warnings \
+  --reason "verified authorized system changes"
+```
+
+The update command requires root privileges, an explicit acknowledgement, and a
+non-empty reason. It serializes operations with scheduled Rkhunter work and
+writes an audit record to:
+
+```text
+/var/log/herodium/rkhunter-baseline.log
+```
 
 ## Runtime Paths
 
@@ -387,9 +503,7 @@ If Maltrail is installed, related logs are typically stored under:
 To remove Herodium and clean up its installed files and service units:
 
 ```bash
-cd installer
-chmod +x uninstall.sh
-sudo ./uninstall.sh
+sudo bash installer/uninstall.sh
 ```
 
 The uninstaller removes:
@@ -422,3 +536,11 @@ This project is best understood as a starting point for:
 - security monitoring research on Debian-based systems
 
 The codebase is intentionally modular so individual components can be replaced, extended, or stripped down depending on the use case.
+
+### Installer reliability and rollback testing
+
+The installer preserves and restores the prior Herodium unit, CLI tools, scheduled-scan assets, deployment manifest, logrotate policy, ClamAV configuration and service/socket/updater state, and the previous pinned Maltrail deployment until the activation transaction passes final health checks. Maltrail is stopped with `SIGINT` so its main process can terminate worker processes cleanly before the timeout. Mutable operator configuration is excluded from the immutable deployment manifest.
+
+Timeshift snapshots are created as on-demand snapshots in a headless command environment without desktop notification helpers and are verified by listing the resulting snapshot before installation continues. This avoids treating a successful snapshot as failed because of an asynchronous desktop-notification error.
+
+A controlled rollback validation can be requested explicitly by running the installer with `HERODIUM_INSTALLER_TEST_FAILPOINT=after_final_validation` and `HERODIUM_INSTALLER_TEST_ACKNOWLEDGE=ROLLBACK-TEST`. This test intentionally fails after all final service checks and must restore the previous deployment and service state; it is not enabled during normal installation. The rollback transaction covers deployed code and installer-managed activation assets. It intentionally does not uninstall APT packages or delete a verified Timeshift snapshot created before activation.
