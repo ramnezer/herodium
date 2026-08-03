@@ -1,19 +1,22 @@
 [Unit]
-Description=Maltrail Sensor Only
+Description=Maltrail Sensor Only (Herodium pinned deployment)
 Documentation=https://github.com/stamparm/maltrail
 After=network.target
+ConditionPathExists=/opt/maltrail/sensor.py
+ConditionFileNotEmpty=/etc/maltrail/maltrail.conf
 
 [Service]
 User=root
 Type=simple
-# Run the sensor only
-ExecStart=/usr/bin/python3 /opt/maltrail/sensor.py
+EnvironmentFile=/etc/maltrail/herodium-maltrail.env
 WorkingDirectory=/opt/maltrail
-
-# Ensure directory exists before execution
-ExecStartPre=/bin/mkdir -p /var/log/maltrail
-
-# Automatic restart on failure
+ExecStartPre=/usr/bin/install -d -o root -g root -m 0755 /var/log/maltrail
+ExecStart=/usr/bin/python3 /opt/maltrail/sensor.py --offline -c /etc/maltrail/maltrail.conf
+KillSignal=SIGINT
+KillMode=mixed
+TimeoutStopSec=60s
+SendSIGKILL=yes
+SuccessExitStatus=130 SIGINT
 Restart=always
 RestartSec=5
 
