@@ -1,10 +1,56 @@
 import os
 import shutil
-import time
-import logging
-import pyclamd
 import threading
+import time
+from dataclasses import dataclass
+from enum import Enum
+from typing import Optional
+
+import pyclamd
+
 from modules.notifier import Notifier
+
+
+class ScanStatus(Enum):
+    CLEAN = "clean"
+    INFECTED = "infected"
+    SKIPPED = "skipped"
+    UNAVAILABLE = "unavailable"
+    ERROR = "error"
+
+
+class ScanReason(Enum):
+    FILE_NOT_FOUND = "file_not_found"
+    EMPTY_FILE = "empty_file"
+    FILE_TOO_LARGE = "file_too_large"
+    STAT_FAILED = "stat_failed"
+    CLAMAV_UNAVAILABLE = "clamav_unavailable"
+    READ_FAILED = "read_failed"
+    SCAN_FAILED = "scan_failed"
+    INVALID_RESPONSE = "invalid_response"
+
+
+@dataclass(frozen=True)
+class ScanResult:
+    status: ScanStatus
+    path: str
+    reason: Optional[ScanReason] = None
+    threat_name: Optional[str] = None
+    detail: Optional[str] = None
+
+    @property
+    def completed(self):
+        return self.status in (ScanStatus.CLEAN, ScanStatus.INFECTED)
+
+    @property
+    def retryable(self):
+        return self.status in (ScanStatus.UNAVAILABLE, ScanStatus.ERROR)
+
+    def __bool__(self):
+        raise TypeError(
+            "ScanResult has no implicit truth value; inspect result.status explicitly"
+        )
+
 
 class ClamAVScanner:
     def __init__(self, config, logger):
@@ -39,60 +85,156 @@ class ClamAVScanner:
         except Exception:
             return default
 
+    @staticmethod
+    def _ping_succeeded(response):
+        """Validate pyClamd and protocol-level PING responses."""
+        if response is True:
+            return True
+        if isinstance(response, bytes):
+            return response.strip().upper() == b'PONG'
+        if isinstance(response, str):
+            return response.strip().upper() == 'PONG'
+        return False
+
     def _connect(self):
+        self.cd = None
         try:
-            self.cd = pyclamd.ClamdUnixSocket(self.socket_path)
-            if self.cd.ping() == 'PONG':
-                self.logger.info("Connected to ClamAV Daemon.")
+            client = pyclamd.ClamdUnixSocket(self.socket_path)
+            ping_response = client.ping()
+            if not self._ping_succeeded(ping_response):
+                self.logger.error(
+                    "ClamAV Connection Failed: invalid ping response "
+                    f"{ping_response!r}"
+                )
+                return False
+            self.cd = client
+            self.logger.info("Connected to ClamAV Daemon.")
+            return True
         except Exception as e:
             self.logger.error(f"ClamAV Connection Failed: {e}")
-            self.cd = None
+            return False
+
+    def health_check(self):
+        """Return True only when the configured clamd endpoint answers PING."""
+        with self.lock:
+            if self.cd is not None:
+                try:
+                    ping_response = self.cd.ping()
+                except Exception as exc:
+                    self.logger.error(f"ClamAV health check failed: {exc}")
+                    self.cd = None
+                else:
+                    if self._ping_succeeded(ping_response):
+                        return True
+                    self.logger.error(
+                        "ClamAV health check failed: invalid ping response "
+                        f"{ping_response!r}"
+                    )
+                    self.cd = None
+
+            return self._connect()
 
     def scan_file(self, file_path):
-        if not os.path.exists(file_path):
-            return False
+        path = os.fspath(file_path)
 
         try:
-            size = os.path.getsize(file_path)
-            if size == 0 or size > self.effective_max_file_size_mb * 1024 * 1024:
-                return False
-        except Exception:
-            return False
+            size = os.path.getsize(path)
+        except FileNotFoundError:
+            return ScanResult(
+                ScanStatus.SKIPPED, path, ScanReason.FILE_NOT_FOUND
+            )
+        except OSError as e:
+            self.logger.error(f"Unable to inspect file before scanning {path}: {e}")
+            return ScanResult(
+                ScanStatus.ERROR, path, ScanReason.STAT_FAILED, detail=str(e)
+            )
+
+        if size == 0:
+            return ScanResult(ScanStatus.SKIPPED, path, ScanReason.EMPTY_FILE)
+
+        max_bytes = self.effective_max_file_size_mb * 1024 * 1024
+        if size > max_bytes:
+            return ScanResult(
+                ScanStatus.SKIPPED,
+                path,
+                ScanReason.FILE_TOO_LARGE,
+                detail=f"size={size}, limit={max_bytes}",
+            )
 
         with self.lock:
-            if not self.cd:
-                self._connect()
-                if not self.cd:
-                    return False
+            if not self.cd and not self._connect():
+                return ScanResult(
+                    ScanStatus.UNAVAILABLE, path, ScanReason.CLAMAV_UNAVAILABLE
+                )
 
             try:
-                with open(file_path, 'rb') as f:
+                with open(path, 'rb') as f:
                     file_content = f.read()
-
-                result = self.cd.scan_stream(file_content)
-
-                if result and 'stream' in result:
-                    virus_info = result['stream']
-                    if isinstance(virus_info, (list, tuple)) and len(virus_info) >= 2:
-                        virus_name = virus_info[1]
-                    else:
-                        virus_name = str(virus_info)
-
-                    if "FOUND" in str(virus_info) and "ERROR" not in str(virus_name):
-                        self.logger.critical(f"VIRUS DETECTED: {file_path} -> {virus_name}")
-
-                        # Execute Policy ---
-                        self._handle_threat(file_path, virus_name)
-                        return True
-
             except FileNotFoundError:
-                pass
-            except Exception as e:
-                if "Broken pipe" not in str(e):
-                    self.logger.error(f"Scan error on {file_path}: {e}")
-                self.cd = None
+                return ScanResult(
+                    ScanStatus.SKIPPED, path, ScanReason.FILE_NOT_FOUND
+                )
+            except OSError as e:
+                self.logger.error(f"Unable to read file for scanning {path}: {e}")
+                return ScanResult(
+                    ScanStatus.ERROR, path, ScanReason.READ_FAILED, detail=str(e)
+                )
 
-        return False
+            try:
+                response = self.cd.scan_stream(file_content)
+            except Exception as e:
+                self.logger.error(f"ClamAV scan failed for {path}: {e}")
+                self.cd = None
+                return ScanResult(
+                    ScanStatus.UNAVAILABLE,
+                    path,
+                    ScanReason.SCAN_FAILED,
+                    detail=str(e),
+                )
+
+        return self._interpret_scan_response(path, response)
+
+    def _interpret_scan_response(self, path, response):
+        if response is None:
+            return ScanResult(ScanStatus.CLEAN, path)
+
+        if not isinstance(response, dict) or 'stream' not in response:
+            self.logger.error(f"Invalid ClamAV response for {path}: {response!r}")
+            return ScanResult(
+                ScanStatus.ERROR,
+                path,
+                ScanReason.INVALID_RESPONSE,
+                detail=repr(response),
+            )
+
+        stream_result = response['stream']
+        if isinstance(stream_result, (list, tuple)):
+            verdict = str(stream_result[0]).upper() if stream_result else ''
+            detail = str(stream_result[1]) if len(stream_result) >= 2 else ''
+        else:
+            verdict = str(stream_result).upper()
+            detail = str(stream_result)
+
+        if verdict == 'OK':
+            return ScanResult(ScanStatus.CLEAN, path)
+
+        if verdict == 'FOUND':
+            virus_name = detail or 'Unknown ClamAV signature'
+            self.logger.critical(f"VIRUS DETECTED: {path} -> {virus_name}")
+            self._handle_threat(path, virus_name)
+            return ScanResult(
+                ScanStatus.INFECTED, path, threat_name=virus_name
+            )
+
+        reason = (
+            ScanReason.SCAN_FAILED
+            if verdict == 'ERROR'
+            else ScanReason.INVALID_RESPONSE
+        )
+        self.logger.error(f"ClamAV scan response error for {path}: {stream_result!r}")
+        return ScanResult(
+            ScanStatus.ERROR, path, reason, detail=detail or repr(stream_result)
+        )
 
     def _handle_threat(self, file_path, virus_name):
         """Executes the action chosen by the user in the installer."""
