@@ -1,0 +1,215 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import stat
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+def _application_root() -> Path:
+    source_root = Path(__file__).resolve().parents[2] / "herodium"
+    if (source_root / "modules" / "rkhunter_manager.py").is_file():
+        return source_root
+    return Path("/opt/herodium")
+
+
+APP_ROOT = _application_root()
+if str(APP_ROOT) not in sys.path:
+    sys.path.insert(0, str(APP_ROOT))
+
+from modules.rkhunter_manager import RkhunterManager  # noqa: E402
+
+
+AUDIT_LOG = Path("/var/log/herodium/rkhunter-baseline.log")
+
+
+class _ConsoleLogger:
+    @staticmethod
+    def warning(message):
+        print(f"[WARNING] {message}", file=sys.stderr)
+
+    @staticmethod
+    def error(message):
+        print(f"[ERROR] {message}", file=sys.stderr)
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Review Rkhunter findings or explicitly update its local file "
+            "properties baseline after authorized system changes."
+        )
+    )
+    action = parser.add_mutually_exclusive_group(required=True)
+    action.add_argument(
+        "--review",
+        action="store_true",
+        help="Run a warnings-only Rkhunter check without changing the baseline.",
+    )
+    action.add_argument(
+        "--update",
+        action="store_true",
+        help="Review current findings and then update the properties baseline.",
+    )
+    parser.add_argument(
+        "--acknowledge-reviewed-warnings",
+        action="store_true",
+        help=(
+            "Required with --update. Confirms that the operator has reviewed "
+            "and validated the current system changes."
+        ),
+    )
+    parser.add_argument(
+        "--reason",
+        default="",
+        help="Required with --update; recorded in the audit log.",
+    )
+    return parser
+
+
+def _safe_operator_name() -> str:
+    raw = os.environ.get("SUDO_USER") or str(os.getuid())
+    normalized = re.sub(r"[^A-Za-z0-9_.@-]", "_", raw)[:64]
+    return normalized or "unknown"
+
+
+def _append_audit(event: str, *, reason: str, result: int) -> None:
+    AUDIT_LOG.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    parent_metadata = AUDIT_LOG.parent.stat()
+    if not stat.S_ISDIR(parent_metadata.st_mode):
+        raise OSError("Herodium log path is not a directory")
+    if parent_metadata.st_uid != 0:
+        raise PermissionError("Herodium log directory is not root-owned")
+    if parent_metadata.st_mode & 0o022:
+        raise PermissionError("Herodium log directory is group/other writable")
+
+    flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(AUDIT_LOG, flags, 0o600)
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise OSError("Rkhunter audit log is not a regular file")
+        if metadata.st_uid != 0:
+            raise PermissionError("Rkhunter audit log is not root-owned")
+        os.fchmod(descriptor, 0o600)
+
+        timestamp = datetime.now(timezone.utc).isoformat()
+        line = (
+            f"{timestamp} operator={_safe_operator_name()} event={event} "
+            f"result={result} reason={reason!r}\n"
+        )
+        os.write(descriptor, line.encode("utf-8", errors="replace"))
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _print_review(result) -> None:
+    print("=== Rkhunter warnings-only review ===")
+    if result.output:
+        print(result.output)
+    elif result.returncode == 0:
+        print("No warnings were reported.")
+    else:
+        print(
+            f"Rkhunter returned exit code {result.returncode} without output.",
+            file=sys.stderr,
+        )
+
+
+def main(argv=None) -> int:
+    args = _parser().parse_args(argv)
+
+    if os.geteuid() != 0:
+        print("[ERROR] This command must be run as root.", file=sys.stderr)
+        return 77
+
+    manager = RkhunterManager(_ConsoleLogger())
+
+    if args.review:
+        review = manager.check()
+        _print_review(review)
+        return review.returncode
+
+    reason = args.reason.strip()
+    if not args.acknowledge_reviewed_warnings:
+        print(
+            "[ERROR] --update requires --acknowledge-reviewed-warnings.",
+            file=sys.stderr,
+        )
+        return 64
+    if not reason:
+        print("[ERROR] --update requires a non-empty --reason.", file=sys.stderr)
+        return 64
+
+    try:
+        _append_audit(
+            "propupd-requested",
+            reason=reason,
+            result=-1,
+        )
+    except (OSError, PermissionError) as exc:
+        print(
+            f"[ERROR] Refusing baseline update because the audit log "
+            f"cannot be prepared safely: {exc}",
+            file=sys.stderr,
+        )
+        return 74
+
+    print(
+        "[WARNING] This operation will trust the current file properties as "
+        "the new Rkhunter baseline. Proceeding because explicit review "
+        "acknowledgement and a reason were supplied."
+    )
+    review, update = manager.review_then_update_properties()
+    _print_review(review)
+
+    if update is None:
+        _append_audit(
+            "propupd-refused",
+            reason=reason,
+            result=review.returncode,
+        )
+        print(
+            "[ERROR] Baseline update was not attempted because the review "
+            "did not complete safely.",
+            file=sys.stderr,
+        )
+        return review.returncode or 1
+
+    try:
+        _append_audit(
+            "propupd",
+            reason=reason,
+            result=update.returncode,
+        )
+    except (OSError, PermissionError) as exc:
+        print(
+            f"[ERROR] Baseline operation completed but the final audit record "
+            f"could not be written: {exc}",
+            file=sys.stderr,
+        )
+        return 74
+    if update.returncode != 0:
+        if update.output:
+            print(update.output, file=sys.stderr)
+        print(
+            f"[ERROR] Rkhunter baseline update failed with exit code "
+            f"{update.returncode}.",
+            file=sys.stderr,
+        )
+        return update.returncode
+
+    print("[PASS] Rkhunter file-properties baseline updated explicitly.")
+    print(f"[PASS] Audit record appended to {AUDIT_LOG}.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
