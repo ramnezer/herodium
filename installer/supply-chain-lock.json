@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "maltrail": {
+    "repository": "https://github.com/stamparm/maltrail.git",
+    "commit": "32bb71160d0c4305386838a29df67923c2919196",
+    "license_sha256": "36d6d9af4331b4153c4d8dc5e3d92836794bd3bfb44744ed24fb4673413d9a0a"
+  }
+}
