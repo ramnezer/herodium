@@ -1,85 +1,124 @@
-import subprocess
-import shutil
-import os
-import logging
-import time 
+from __future__ import annotations
+
 import glob
+import time
+
+from core.system_command import (
+    SystemCommandError,
+    run_system_tool,
+    system_tool_available,
+)
+
 
 class IPSManager:
     def __init__(self, config, logger):
-        self.config = config
+        self.config = config or {}
         self.logger = logger
-        self.enabled = self.config.get('ips', {}).get('enable', False)
+        ips_config = self.config.get("ips", {}) or {}
+        self.enabled = self._safe_bool(ips_config.get("enable"), False)
+        self.bantime = self._safe_int(ips_config.get("bantime"), 3600, 1)
+        self.maxretry = self._safe_int(ips_config.get("maxretry"), 3, 1)
+        self.findtime = self._safe_int(ips_config.get("findtime"), 60, 1)
 
-        self.bantime = self.config.get('ips', {}).get('bantime', 3600)
-        self.maxretry = self.config.get('ips', {}).get('maxretry', 3)
+    @staticmethod
+    def _safe_bool(value, default=False):
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, int) and value in (0, 1):
+            return bool(value)
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in ("1", "true", "yes", "on"):
+                return True
+            if normalized in ("0", "false", "no", "off"):
+                return False
+        return default
 
+    @staticmethod
+    def _safe_int(value, default, minimum):
         try:
-            self.findtime = int(self.config.get('ips', {}).get('findtime', 60) or 60)
-        except Exception:
-            self.findtime = 60
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return default
+        return max(minimum, parsed)
 
     def start(self):
         if not self.enabled:
             self.logger.info("IPS (Fail2Ban) is DISABLED in config.")
-            return
+            return True
 
         self.logger.info("Initializing Network IPS (Fail2Ban)...")
 
-        if not shutil.which('fail2ban-client'):
+        if not system_tool_available("fail2ban-client"):
             self.logger.warning(
                 "Fail2Ban is enabled in config but not installed. "
                 "Install it from the Herodium installer."
             )
-            return
+            return False
 
         if not self._has_existing_herodium_jail():
             self.logger.warning(
-                "No Herodium Fail2Ban jail config found in /etc/fail2ban/jail.d/. "
-                "The installer should create it."
+                "No Herodium Fail2Ban jail config found in "
+                "/etc/fail2ban/jail.d/. The installer should create it."
             )
 
-        self._ensure_running()
+        return self._ensure_running()
 
     def _has_existing_herodium_jail(self) -> bool:
         try:
-            matches = glob.glob("/etc/fail2ban/jail.d/herodium*.conf")
-            return len(matches) > 0
-        except Exception:
+            return bool(glob.glob("/etc/fail2ban/jail.d/herodium*.conf"))
+        except OSError as exc:
+            self.logger.warning(f"Unable to inspect Fail2Ban jail configuration: {exc}")
             return False
 
     def _ensure_running(self):
-        """Ensure the service is running without installing or writing configs."""
+        """Ensure the preconfigured Fail2Ban service is running."""
         try:
-            subprocess.run(
-                ['systemctl', 'enable', 'fail2ban'],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=False
+            enable_result = run_system_tool(
+                "systemctl",
+                ("enable", "fail2ban"),
+                quiet=True,
+                timeout=30,
             )
-            subprocess.run(
-                ['systemctl', 'restart', 'fail2ban'],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=False
+            if enable_result.returncode != 0:
+                self.logger.error("Could not enable Fail2Ban service.")
+                return False
+
+            restart_result = run_system_tool(
+                "systemctl",
+                ("restart", "fail2ban"),
+                quiet=True,
+                timeout=30,
             )
+            if restart_result.returncode != 0:
+                self.logger.error("Could not restart Fail2Ban service.")
+                return False
 
             for _ in range(5):
                 time.sleep(1)
-                res = subprocess.run(
-                    ['fail2ban-client', 'ping'],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True
+                ping_result = run_system_tool(
+                    "fail2ban-client",
+                    ("ping",),
+                    capture=True,
+                    timeout=10,
                 )
-                if "Server replied: pong" in res.stdout:
-                    self.logger.info("IPS Active: SSH Brute-Force Protection Enabled.")
-                    return
+                if (
+                    ping_result.returncode == 0
+                    and "server replied: pong" in ping_result.stdout.lower()
+                ):
+                    self.logger.info(
+                        "IPS Active: SSH Brute-Force Protection Enabled."
+                    )
+                    return True
 
-            self.logger.warning("IPS Service started but timed out waiting for socket.")
-
-        except Exception as e:
-            self.logger.error(f"Error managing Fail2Ban service: {e}")
+            self.logger.warning(
+                "IPS Service started but timed out waiting for socket."
+            )
+            return False
+        except (SystemCommandError, OSError, TimeoutError) as exc:
+            self.logger.error(f"Error managing Fail2Ban service: {exc}")
+            return False
 
     def stop(self):
-        pass
+        """Fail2Ban remains managed by systemd when Herodium exits."""
+        return True
