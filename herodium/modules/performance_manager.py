@@ -1,7 +1,11 @@
-import time
+from __future__ import annotations
+
 import threading
-import subprocess
+import time
+
 import psutil
+
+from core.system_command import SystemCommandError, run_system_tool
 
 
 class PerformanceManager:
@@ -9,260 +13,333 @@ class PerformanceManager:
         self.config = config or {}
         self.logger = logger
         self.stop_event = threading.Event()
+        self._thread = None
         self.current_limit_value = None
         self.target_service = "clamav-daemon.service"
-        self.daemon_name = "clamd"  # The actual process name
-
+        self.daemon_name = "clamd"
         self.cpu_count = psutil.cpu_count(logical=True) or 1
 
-        # Cap as % of whole machine (0-100). Default: 30 to match your requirement.
-        perf_cfg = (self.config.get("performance") or {})
-        self.cap_machine_percent = int(perf_cfg.get("cpu_limit_percent", 30) or 30)
+        perf_config = self.config.get("performance", {}) or {}
+        self.cap_machine_percent = self._bounded_int(
+            perf_config.get("cpu_limit_percent"),
+            default=30,
+            minimum=1,
+            maximum=100,
+        )
 
-        # Original process priority state (captured once per clamd PID)
         self.priority_pid = None
         self.original_nice = None
         self.original_ionice = None
 
-        self.logger.info(f"Performance Controller Active. Cores: {self.cpu_count}")
+        self.logger.info(
+            f"Performance Controller Active. Cores: {self.cpu_count}"
+        )
+
+    @staticmethod
+    def _bounded_int(value, *, default, minimum, maximum):
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return default
+        return max(minimum, min(maximum, parsed))
 
     def start(self):
-        # Best-effort cleanup: remove any stale quota from previous runs/manual changes
-        self._force_release_quota()
+        if self._thread is not None and self._thread.is_alive():
+            return True
+
+        cleanup_ok = self._force_release_quota()
         self._clear_priority_state()
-        threading.Thread(target=self._loop, daemon=True).start()
+        self.stop_event.clear()
+        self._thread = threading.Thread(
+            target=self._loop,
+            daemon=True,
+            name="herodium-performance-manager",
+        )
+        self._thread.start()
+        return cleanup_ok and self._thread.is_alive()
 
     def _force_release_quota(self):
-        """Always try to clear CPUQuota even if we didn't set it in this run."""
+        """Clear a stale runtime CPUQuota before starting the controller."""
         try:
-            subprocess.run(
-                ['systemctl', 'set-property', '--runtime', self.target_service, 'CPUQuota='],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=False
+            result = run_system_tool(
+                "systemctl",
+                (
+                    "set-property",
+                    "--runtime",
+                    self.target_service,
+                    "CPUQuota=",
+                ),
+                quiet=True,
+                timeout=30,
             )
-        except Exception:
-            pass
+        except SystemCommandError as exc:
+            self.logger.warning(f"Unable to clear stale ClamAV CPUQuota: {exc}")
+            return False
+
+        if result.returncode != 0:
+            self.logger.warning("Unable to clear stale ClamAV CPUQuota.")
+            return False
 
         self.current_limit_value = None
+        return True
 
     def stop(self):
         self.stop_event.set()
-        self._remove_limit()
+        released = self._remove_limit()
+        thread = self._thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=5)
+        return released
 
     def _clear_priority_state(self):
-        """Forget saved baseline priority state."""
         self.priority_pid = None
         self.original_nice = None
         self.original_ionice = None
 
     def _scan_in_progress(self) -> bool:
-        """Detect manual/scheduled scans by presence of clamdscan/clamscan."""
+        """Detect manual or scheduled ClamAV scans."""
         try:
-            for p in psutil.process_iter(['name']):
-                n = (p.info.get('name') or '')
-                if n in ('clamdscan', 'clamscan'):
+            for process in psutil.process_iter(["name"]):
+                name = process.info.get("name") or ""
+                if name in ("clamdscan", "clamscan"):
                     return True
-        except Exception:
-            pass
+        except psutil.Error as exc:
+            self.logger.debug(f"Unable to inspect ClamAV scan processes: {exc}")
         return False
 
     def _loop(self):
-        # LIVE mode hysteresis + cooldown to prevent quota flapping
-        APPLY_THRESHOLD = 60    # % of total machine (0-100)
-        RELEASE_THRESHOLD = 40  # % of total machine (0-100)
-        MIN_HOLD_SECONDS = 30   # minimum time between state changes
-
+        apply_threshold = 60
+        release_threshold = 40
+        minimum_hold_seconds = 30
         last_change = 0.0
 
         while not self.stop_event.is_set():
             try:
-                clamd_proc = self._get_clamd_process()
-                if not clamd_proc:
-                    time.sleep(3)
+                clamd_process = self._get_clamd_process()
+                if clamd_process is None:
+                    self.stop_event.wait(3)
                     continue
 
-                # Process cpu_percent can be >100 on multi-core.
-                # Divide by cpu_count to get 0-100 "machine percent".
                 try:
-                    cpu_usage = clamd_proc.cpu_percent(interval=1.5) / self.cpu_count
-                except Exception:
-                    cpu_usage = 0
+                    cpu_usage = (
+                        clamd_process.cpu_percent(interval=1.5) / self.cpu_count
+                    )
+                except psutil.Error as exc:
+                    self.logger.debug(f"Unable to read clamd CPU usage: {exc}")
+                    cpu_usage = 0.0
 
                 thermal_limit = self._get_thermal_limit()
+                now = time.monotonic()
+                can_change = (now - last_change) >= minimum_hold_seconds
 
-                now = time.time()
-                can_change = (now - last_change) >= MIN_HOLD_SECONDS
-
-                # 1) Thermal override (keeps your existing behavior)
                 if thermal_limit < 100:
-                    target_quota = 20  # machine percent
+                    target_quota = 20
                     systemd_quota = int(target_quota * self.cpu_count)
                     if can_change and systemd_quota != self.current_limit_value:
-                        self._apply_limit(systemd_quota, clamd_proc.pid)
+                        if self._apply_limit(systemd_quota, clamd_process.pid):
+                            last_change = now
+                elif self._scan_in_progress():
+                    systemd_quota = int(
+                        self.cap_machine_percent * self.cpu_count
+                    )
+                    if systemd_quota != self.current_limit_value:
+                        self._apply_limit(systemd_quota, clamd_process.pid)
+                elif self.current_limit_value is None:
+                    if can_change and cpu_usage >= apply_threshold:
+                        systemd_quota = int(
+                            self.cap_machine_percent * self.cpu_count
+                        )
+                        if self._apply_limit(systemd_quota, clamd_process.pid):
+                            last_change = now
+                elif can_change and cpu_usage <= release_threshold:
+                    if self._remove_limit():
                         last_change = now
+            except psutil.Error as exc:
+                self.logger.error(f"Performance Manager psutil error: {exc}")
+            except (OSError, ValueError, TypeError) as exc:
+                self.logger.error(f"Performance Manager error: {exc}")
 
-                else:
-                    # 2) Manual/Scheduled scan: HOLD fixed cap during the scan (no flapping)
-                    if self._scan_in_progress():
-                        systemd_quota = int(self.cap_machine_percent * self.cpu_count)
-                        if systemd_quota != self.current_limit_value:
-                            self._apply_limit(systemd_quota, clamd_proc.pid)
-                        # Do NOT release while scan is running
-
-                    # 3) LIVE behavior (your current logic) but cap is configurable (default 30)
-                    else:
-                        if self.current_limit_value is None:
-                            if can_change and cpu_usage >= APPLY_THRESHOLD:
-                                systemd_quota = int(self.cap_machine_percent * self.cpu_count)
-                                self._apply_limit(systemd_quota, clamd_proc.pid)
-                                last_change = now
-                        else:
-                            if can_change and cpu_usage <= RELEASE_THRESHOLD:
-                                self._remove_limit()
-                                last_change = now
-
-            except Exception as e:
-                self.logger.error(f"Performance Manager Error: {e}")
-
-            time.sleep(3)
+            self.stop_event.wait(3)
 
     def _get_clamd_process(self):
-        """Find the real clamd daemon process only."""
-        for proc in psutil.process_iter(['pid', 'name']):
-            name = (proc.info.get('name') or '').strip()
+        for process in psutil.process_iter(["pid", "name"]):
+            name = (process.info.get("name") or "").strip()
             if name == self.daemon_name:
-                return proc
+                return process
         return None
 
     def _get_thermal_limit(self):
-        """Return throttling factor (100 = no limit, lower = percentage)."""
         try:
-            temps = psutil.sensors_temperatures()
-            if not temps:
-                return 100
-
-            max_temp = 0
-            for entry in temps.values():
-                for sensor in entry:
-                    if sensor.current > max_temp:
-                        max_temp = sensor.current
-
-            if max_temp > 90:
-                return 10  # Critical
-            if max_temp > 80:
-                return 50  # Hot
-            return 100
-        except Exception:
+            temperatures = psutil.sensors_temperatures()
+        except (AttributeError, psutil.Error) as exc:
+            self.logger.debug(f"Unable to read temperature sensors: {exc}")
             return 100
 
-    def _capture_original_priority(self, proc):
-        """Capture baseline nice/ionice once per PID before throttling."""
-        if self.priority_pid == proc.pid:
+        if not temperatures:
+            return 100
+
+        max_temperature = max(
+            (
+                sensor.current
+                for entries in temperatures.values()
+                for sensor in entries
+                if sensor.current is not None
+            ),
+            default=0,
+        )
+        if max_temperature > 90:
+            return 10
+        if max_temperature > 80:
+            return 50
+        return 100
+
+    def _capture_original_priority(self, process):
+        if self.priority_pid == process.pid:
             return
 
         try:
-            self.original_nice = proc.nice()
-        except Exception:
+            self.original_nice = process.nice()
+        except psutil.Error as exc:
+            self.logger.debug(f"Unable to read clamd nice value: {exc}")
             self.original_nice = None
 
         try:
-            io = proc.ionice()
-
-            if hasattr(io, 'ioclass'):
-                self.original_ionice = (io.ioclass, getattr(io, 'value', 0))
-            elif isinstance(io, (tuple, list)) and len(io) >= 1:
-                io_value = io[1] if len(io) > 1 else 0
-                self.original_ionice = (io[0], io_value)
+            io_priority = process.ionice()
+            if hasattr(io_priority, "ioclass"):
+                self.original_ionice = (
+                    io_priority.ioclass,
+                    getattr(io_priority, "value", 0),
+                )
+            elif isinstance(io_priority, (tuple, list)) and io_priority:
+                io_value = io_priority[1] if len(io_priority) > 1 else 0
+                self.original_ionice = (io_priority[0], io_value)
             else:
                 self.original_ionice = None
-        except Exception:
+        except psutil.Error as exc:
+            self.logger.debug(f"Unable to read clamd ionice value: {exc}")
             self.original_ionice = None
 
-        self.priority_pid = proc.pid
+        self.priority_pid = process.pid
 
     def _restore_original_priority(self):
-        """Restore original nice/ionice for the same PID if it still exists."""
         if self.priority_pid is None:
-            return
+            return True
 
         try:
-            proc = psutil.Process(self.priority_pid)
-        except Exception:
+            process = psutil.Process(self.priority_pid)
+        except psutil.Error:
             self._clear_priority_state()
-            return
+            return True
 
-        try:
-            if self.original_nice is not None:
-                proc.nice(self.original_nice)
-        except Exception:
-            pass
+        restored = True
+        if self.original_nice is not None:
+            try:
+                process.nice(self.original_nice)
+            except psutil.Error as exc:
+                self.logger.warning(f"Unable to restore clamd nice value: {exc}")
+                restored = False
 
-        try:
-            if self.original_ionice is not None:
-                io_class, io_value = self.original_ionice
-                proc.ionice(ioclass=io_class, value=io_value)
-        except Exception:
-            pass
+        if self.original_ionice is not None:
+            io_class, io_value = self.original_ionice
+            try:
+                process.ionice(ioclass=io_class, value=io_value)
+            except psutil.Error as exc:
+                self.logger.warning(f"Unable to restore clamd ionice value: {exc}")
+                restored = False
 
         self._clear_priority_state()
+        return restored
 
     def _apply_limit(self, limit, pid):
         try:
-            proc = psutil.Process(pid)
+            process = psutil.Process(pid)
+        except psutil.Error as exc:
+            self.logger.warning(f"Unable to access clamd process {pid}: {exc}")
+            return False
 
-            # Save original process priority only once for this PID
-            self._capture_original_priority(proc)
+        self._capture_original_priority(process)
 
-            subprocess.run(
-                ['systemctl', 'set-property', '--runtime', self.target_service, f'CPUQuota={limit}%'],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=False
+        try:
+            quota_result = run_system_tool(
+                "systemctl",
+                (
+                    "set-property",
+                    "--runtime",
+                    self.target_service,
+                    f"CPUQuota={limit}%",
+                ),
+                quiet=True,
+                timeout=30,
             )
+        except SystemCommandError as exc:
+            self.logger.error(f"Unable to apply ClamAV CPUQuota: {exc}")
+            return False
 
-            try:
-                proc.nice(19)
-            except Exception:
-                subprocess.run(
-                    ['renice', '-n', '19', '-p', str(pid)],
-                    check=False,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL
-                )
+        if quota_result.returncode != 0:
+            self.logger.error("Unable to apply ClamAV CPUQuota.")
+            return False
 
-            try:
-                proc.ionice(ioclass=psutil.IOPRIO_CLASS_IDLE)
-            except Exception:
-                subprocess.run(
-                    ['ionice', '-c', '3', '-p', str(pid)],
-                    check=False,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL
-                )
+        try:
+            process.nice(19)
+        except psutil.Error as exc:
+            self.logger.debug(f"psutil nice update failed, using renice: {exc}")
+            self._run_priority_fallback("renice", ("-n", "19", "-p", pid))
 
-            self.current_limit_value = limit
-            self.logger.info(f"Throttling ClamAV to {limit}% CPUQuota")
-        except Exception:
-            pass
+        try:
+            process.ionice(ioclass=psutil.IOPRIO_CLASS_IDLE)
+        except psutil.Error as exc:
+            self.logger.debug(f"psutil ionice update failed, using ionice: {exc}")
+            self._run_priority_fallback("ionice", ("-c", "3", "-p", pid))
+
+        self.current_limit_value = limit
+        self.logger.info(f"Throttling ClamAV to {limit}% CPUQuota")
+        return True
+
+    def _run_priority_fallback(self, tool_name, arguments):
+        try:
+            result = run_system_tool(
+                tool_name,
+                arguments,
+                quiet=True,
+                timeout=15,
+            )
+        except SystemCommandError as exc:
+            self.logger.warning(f"Unable to run {tool_name}: {exc}")
+            return False
+        if result.returncode != 0:
+            self.logger.warning(f"{tool_name} failed for clamd process.")
+            return False
+        return True
 
     def _remove_limit(self):
-        """Release CPUQuota and restore original process priority if possible."""
         had_limit = self.current_limit_value is not None
+        quota_released = True
 
         if had_limit:
             try:
-                subprocess.run(
-                    ['systemctl', 'set-property', '--runtime', self.target_service, 'CPUQuota='],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    check=False
+                result = run_system_tool(
+                    "systemctl",
+                    (
+                        "set-property",
+                        "--runtime",
+                        self.target_service,
+                        "CPUQuota=",
+                    ),
+                    quiet=True,
+                    timeout=30,
                 )
-            except Exception:
-                pass
+            except SystemCommandError as exc:
+                self.logger.error(f"Unable to release ClamAV CPUQuota: {exc}")
+                quota_released = False
+            else:
+                quota_released = result.returncode == 0
+                if not quota_released:
+                    self.logger.error("Unable to release ClamAV CPUQuota.")
 
-        self.current_limit_value = None
-        self._restore_original_priority()
+        priorities_restored = self._restore_original_priority()
+        if quota_released:
+            self.current_limit_value = None
+            if had_limit:
+                self.logger.info("ClamAV Throttling Released")
 
-        if had_limit:
-            self.logger.info("ClamAV Throttling Released")
+        return quota_released and priorities_restored
