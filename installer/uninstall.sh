@@ -93,21 +93,33 @@ systemctl daemon-reload
 # 3. Remove Files and Directories
 echo "[3/6] Cleaning up files..."
 
-# Best-effort restore of AppArmor baseline state before deleting Herodium files.
-# Only restore when Herodium saved a baseline. Do not modify a system/user-owned
-# /etc/apparmor.d/force-complain directory just because it exists.
-APPARMOR_BASELINE_DIR="${APP_DIR}/apparmor_state_data/baseline_force-complain"
+# Restore the persistent AppArmor baseline before deleting application files.
+# Persistent state remains under /var/lib/herodium so upgrades and reinstalls
+# cannot accidentally redefine the pre-Herodium baseline.
+APPARMOR_STATE_TOOL="${APP_DIR}/modules/apparmor_state.py"
 
-if [[ -d "${APPARMOR_BASELINE_DIR}" ]]; then
+if [[ -f "${APPARMOR_STATE_TOOL}" ]]; then
     echo " -> Restoring AppArmor baseline mode state..."
+    set +e
+    python3 "${APPARMOR_STATE_TOOL}" restore
+    APPARMOR_RESTORE_RC=$?
+    set -e
 
-    rm -rf /etc/apparmor.d/force-complain 2>/dev/null || true
-    cp -a "${APPARMOR_BASELINE_DIR}" /etc/apparmor.d/force-complain
-
-    systemctl reload-or-restart apparmor 2>/dev/null || true
+    if [[ ${APPARMOR_RESTORE_RC} -eq 0 ]]; then
+        if systemctl reload-or-restart apparmor; then
+            python3 "${APPARMOR_STATE_TOOL}" write-level 1
+            echo " -> AppArmor baseline restored; persistent state preserved."
+        else
+            echo "WARNING: AppArmor baseline files were restored, but AppArmor reload failed."
+        fi
+    elif [[ ${APPARMOR_RESTORE_RC} -eq 2 ]]; then
+        echo " -> No Herodium AppArmor baseline found; leaving force-complain state unchanged."
+    else
+        echo "WARNING: AppArmor baseline restoration failed; persistent state was preserved for recovery."
+    fi
     echo " -> Leaving auditd service state unchanged."
 else
-    echo " -> No Herodium AppArmor baseline found; leaving AppArmor force-complain state unchanged."
+    echo "WARNING: AppArmor state tool is unavailable; persistent state was left unchanged."
 fi
 
 rm -rf "${APP_DIR}"
@@ -131,6 +143,7 @@ fi
 # Remove Binaries/Scripts
 rm -f /usr/local/bin/herodium-scan
 rm -f /usr/local/bin/herodium-top
+rm -f /usr/local/sbin/herodium-rkhunter-baseline
 rm -f /usr/local/bin/herodium_scheduled_scan.sh
 
 # Remove Fail2Ban Custom Config
