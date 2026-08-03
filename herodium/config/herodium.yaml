@@ -40,8 +40,29 @@ directories:
   # Optional: ignore /home/*/.cache and /root/.cache to improve performance
   ignore_user_cache: false
 
+  # Bound live filesystem scan backlog and in-memory dedup state.
+  scan_queue_max_size: 1024
+
+  # Rate-limit queue pressure warnings during large filesystem bursts.
+  scan_queue_warning_interval_seconds: 30
+
+  # Coalesce dropped live events into bounded root-level catch-up scans.
+  scan_recovery_enable: true
+  scan_recovery_max_roots: 8
+  scan_recovery_queue_low_watermark_percent: 25
+  scan_recovery_max_files_per_pass: 2048
+  scan_recovery_max_total_files_per_root: 250000
+  scan_recovery_max_seconds_per_pass: 5
+  scan_recovery_max_depth: 64
+
+  # Aggregate transient directory changes during removable-media recovery.
+  scan_recovery_directory_warning_interval_seconds: 30
+
 clamav:
   socket_path: "/var/run/clamav/clamd.ctl"
+
+  # Keep clamd extraction/normalization files outside live-monitored paths.
+  temporary_directory: "/var/lib/clamav/herodium-tmp"
   max_file_size_mb: 25
   stream_max_length_mb: 25
   threat_action: "quarantine"
@@ -74,6 +95,16 @@ maltrail:
   ping_before_block: false
   desktop_notifications: true
   desktop_log: true
+
+  # Coalesce repeated identical IOC alerts to prevent desktop/log flooding.
+  alert_cooldown_seconds: 300
+  alert_cache_max_entries: 1024
+
+  # Cache positive and negative DNS lookups so repeated NXDOMAIN events do
+  # not delay later blockable IP events in the single Maltrail log consumer.
+  dns_resolution_cache_seconds: 300
+  dns_resolution_cache_max_entries: 1024
+
   clean_interval_hours: 168
 
 performance:
