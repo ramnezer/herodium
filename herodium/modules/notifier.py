@@ -1,7 +1,15 @@
-import subprocess
-import logging
-import os
+from __future__ import annotations
+
 import pwd
+from pathlib import Path
+
+from core.system_command import (
+    SystemCommandError,
+    resolve_system_tool,
+    run_system_tool,
+    system_tool_available,
+)
+
 
 class Notifier:
     def __init__(self, config, logger, scope="general"):
@@ -10,115 +18,127 @@ class Notifier:
         self.scope = scope
         self.enabled = self._resolve_enabled_state()
 
-    def _resolve_enabled_state(self):
-        """
-        Resolve notification enablement by scope.
-
-        general  -> notifications.enable (default: True)
-        maltrail -> maltrail.desktop_notifications
-                    fallback to notifications.enable
-                    fallback to True
-        """
-        try:
-            notifications_cfg = (self.config.get('notifications') or {})
-            maltrail_cfg = (self.config.get('maltrail') or {})
-
-            if self.scope == "maltrail":
-                if 'desktop_notifications' in maltrail_cfg:
-                    return bool(maltrail_cfg.get('desktop_notifications'))
-                if 'enable' in notifications_cfg:
-                    return bool(notifications_cfg.get('enable'))
+    @staticmethod
+    def _safe_bool(value, default=True):
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, int) and value in (0, 1):
+            return bool(value)
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in ("1", "true", "yes", "on"):
                 return True
+            if normalized in ("0", "false", "no", "off"):
+                return False
+        return default
 
-            if 'enable' in notifications_cfg:
-                return bool(notifications_cfg.get('enable'))
+    def _resolve_enabled_state(self):
+        """Resolve notification enablement by scope with safe booleans."""
+        notifications_config = self.config.get("notifications", {}) or {}
+        maltrail_config = self.config.get("maltrail", {}) or {}
 
+        if self.scope == "maltrail":
+            if "desktop_notifications" in maltrail_config:
+                return self._safe_bool(
+                    maltrail_config.get("desktop_notifications"), True
+                )
+            if "enable" in notifications_config:
+                return self._safe_bool(notifications_config.get("enable"), True)
             return True
 
-        except Exception:
-            return True
+        if "enable" in notifications_config:
+            return self._safe_bool(notifications_config.get("enable"), True)
+        return True
 
-    def send_notification(self, title, message, level='normal'):
-        """
-        Send a desktop notification to all active logged-in users.
-        Uses 'env' inside sudo/runuser to bypass environment scrubbing.
-        """
+    def send_notification(self, title, message, level="normal"):
+        """Send a desktop notification to active non-system user sessions."""
         if not self.enabled:
-            return
+            return False
 
+        base_run_dir = Path("/run/user")
         try:
-            base_run_dir = '/run/user'
-            if not os.path.exists(base_run_dir):
-                return
+            entries = tuple(base_run_dir.iterdir())
+        except OSError as exc:
+            self.logger.error(f"Notification loop error: {exc}")
+            return False
 
-            for entry in os.listdir(base_run_dir):
-                if not entry.isdigit():
-                    continue
+        delivered = False
+        for entry in entries:
+            if not entry.name.isdigit():
+                continue
 
-                uid = int(entry)
-                if uid < 1000:
-                    continue
+            uid = int(entry.name)
+            if uid < 1000:
+                continue
 
-                try:
-                    user_name = pwd.getpwuid(uid).pw_name
-                    dbus_path = f"{base_run_dir}/{uid}/bus"
+            try:
+                user_name = pwd.getpwuid(uid).pw_name
+            except KeyError:
+                continue
 
-                    if not os.path.exists(dbus_path):
-                        continue
+            dbus_path = entry / "bus"
+            if not dbus_path.exists():
+                continue
 
-                    self._dispatch(user_name, uid, dbus_path, title, message, level)
+            if self._dispatch(
+                user_name,
+                uid,
+                dbus_path,
+                str(title),
+                str(message),
+                str(level),
+            ):
+                delivered = True
 
-                except KeyError:
-                    continue
-
-        except Exception as e:
-            self.logger.error(f"Notification loop error: {e}")
+        return delivered
 
     def _dispatch(self, user, uid, dbus_path, title, message, level):
-        """Dispatch a notification to a specific desktop session."""
+        """Dispatch a notification to one desktop session."""
+        urgency = level if level in {"low", "normal", "critical"} else "normal"
         try:
-            env_prefix = [
-                '/usr/bin/env',
-                f'DBUS_SESSION_BUS_ADDRESS=unix:path={dbus_path}',
-                f'XDG_RUNTIME_DIR=/run/user/{uid}',
-                'DISPLAY=:0',
+            env_path = resolve_system_tool("env")
+            notify_path = resolve_system_tool("notify-send")
+
+            env_arguments = [
+                str(env_path),
+                f"DBUS_SESSION_BUS_ADDRESS=unix:path={dbus_path}",
+                f"XDG_RUNTIME_DIR=/run/user/{uid}",
+                "DISPLAY=:0",
+                str(notify_path),
+                title,
+                message,
+                "-t",
+                "10000",
+                "-u",
+                urgency,
+                "-i",
+                "security-high",
             ]
 
-            if os.path.exists('/usr/bin/sudo'):
-                cmd = [
-                    '/usr/bin/sudo',
-                    '-u', user,
-                ] + env_prefix + [
-                    '/usr/bin/notify-send',
-                    title,
-                    message,
-                    '-t', '10000',
-                    '-u', level,
-                    '-i', 'security-high'
-                ]
-            elif os.path.exists('/usr/sbin/runuser'):
-                cmd = [
-                    '/usr/sbin/runuser',
-                    '-u', user,
-                    '--',
-                ] + env_prefix + [
-                    '/usr/bin/notify-send',
-                    title,
-                    message,
-                    '-t', '10000',
-                    '-u', level,
-                    '-i', 'security-high'
-                ]
+            if system_tool_available("sudo"):
+                tool = "sudo"
+                arguments = ["-u", user, *env_arguments]
+            elif system_tool_available("runuser"):
+                tool = "runuser"
+                arguments = ["-u", user, "--", *env_arguments]
             else:
-                self.logger.warning('Notification skipped: neither sudo nor runuser is available.')
-                return
+                self.logger.warning(
+                    "Notification skipped: neither sudo nor runuser is available."
+                )
+                return False
 
-            subprocess.run(
-                cmd,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=False
+            result = run_system_tool(
+                tool,
+                arguments,
+                quiet=True,
+                timeout=15,
             )
-
-        except Exception as e:
-            self.logger.error(f"Failed to notify user {user}: {e}")
+            if result.returncode != 0:
+                self.logger.warning(
+                    f"Desktop notification command failed for user {user}."
+                )
+                return False
+            return True
+        except (SystemCommandError, OSError, TimeoutError) as exc:
+            self.logger.error(f"Failed to notify user {user}: {exc}")
+            return False
