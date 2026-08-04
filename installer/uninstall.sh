@@ -40,11 +40,15 @@ echo "=========================================="
 # 1. Stop and Disable Services
 echo "[1/6] Stopping services..."
 systemctl stop herodium.service 2>/dev/null || true
+systemctl stop herodium-maltrail-update.timer 2>/dev/null || true
+systemctl stop herodium-maltrail-update.service 2>/dev/null || true
 systemctl stop maltrail-sensor.service 2>/dev/null || true
 systemctl stop herodium-scheduled-scan.timer 2>/dev/null || true
 systemctl stop herodium-scheduled-scan.service 2>/dev/null || true
 
 systemctl disable herodium.service 2>/dev/null || true
+systemctl disable herodium-maltrail-update.timer 2>/dev/null || true
+systemctl disable herodium-maltrail-update.service 2>/dev/null || true
 systemctl disable maltrail-sensor.service 2>/dev/null || true
 systemctl disable herodium-scheduled-scan.timer 2>/dev/null || true
 systemctl disable herodium-scheduled-scan.service 2>/dev/null || true
@@ -86,6 +90,8 @@ fi
 echo "[2/6] Removing service files..."
 rm -f /etc/systemd/system/herodium.service
 rm -f /etc/systemd/system/maltrail-sensor.service
+rm -f /etc/systemd/system/herodium-maltrail-update.service
+rm -f /etc/systemd/system/herodium-maltrail-update.timer
 rm -f /etc/systemd/system/herodium-scheduled-scan.service
 rm -f /etc/systemd/system/herodium-scheduled-scan.timer
 systemctl daemon-reload
@@ -144,7 +150,9 @@ fi
 rm -f /usr/local/bin/herodium-scan
 rm -f /usr/local/bin/herodium-top
 rm -f /usr/local/sbin/herodium-rkhunter-baseline
+rm -f /usr/local/sbin/herodium-maltrail-update
 rm -f /usr/local/bin/herodium_scheduled_scan.sh
+rm -rf /run/herodium-maltrail-update
 
 # Remove Fail2Ban Custom Config
 if [[ -f /etc/fail2ban/jail.d/herodium-ddos.conf ]]; then
