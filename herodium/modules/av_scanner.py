@@ -1,5 +1,6 @@
 import os
-import shutil
+import stat
+import tempfile
 import threading
 import time
 from dataclasses import dataclass
@@ -273,15 +274,100 @@ class ClamAVScanner:
             self.logger.error(f"Unexpected error deleting {file_path}: {e}")
 
     def _quarantine(self, file_path, virus_name):
+        dest = None
+        dest_complete = False
+        source_fd = None
+        dest_fd = None
+
         try:
-            os.makedirs(self.quarantine_dir, exist_ok=True)
+            try:
+                initial_stat = os.lstat(file_path)
+            except FileNotFoundError:
+                self.logger.info(f"Quarantine skipped (file vanished): {file_path}")
+                return
+
+            if not stat.S_ISREG(initial_stat.st_mode):
+                self.logger.error(
+                    "Quarantine refused non-regular source path: "
+                    f"{file_path}"
+                )
+                return
+
+            if os.path.lexists(self.quarantine_dir):
+                quarantine_stat = os.lstat(self.quarantine_dir)
+                if not stat.S_ISDIR(quarantine_stat.st_mode):
+                    raise OSError(
+                        "quarantine path exists but is not a real directory: "
+                        f"{self.quarantine_dir}"
+                    )
+            else:
+                os.makedirs(self.quarantine_dir, mode=0o700, exist_ok=False)
+
+            # The service runs as root. Normalize the directory on every use so
+            # older installations cannot preserve permissive ownership or modes.
+            os.chown(self.quarantine_dir, 0, 0)
+            os.chmod(self.quarantine_dir, 0o700)
+
+            source_flags = os.O_RDONLY
+            source_flags |= getattr(os, "O_CLOEXEC", 0)
+            source_flags |= getattr(os, "O_NOFOLLOW", 0)
+            source_fd = os.open(file_path, source_flags)
+            opened_stat = os.fstat(source_fd)
+
+            if not stat.S_ISREG(opened_stat.st_mode):
+                raise OSError(f"quarantine source is not a regular file: {file_path}")
+            if (
+                opened_stat.st_dev != initial_stat.st_dev
+                or opened_stat.st_ino != initial_stat.st_ino
+            ):
+                raise OSError(f"quarantine source changed before capture: {file_path}")
 
             file_name = os.path.basename(file_path)
-            new_name = f"{file_name}_{int(time.time())}.infected"
-            dest = os.path.join(self.quarantine_dir, new_name)
+            prefix = f"{file_name}_{time.time_ns()}_{os.getpid()}_"
+            dest_fd, dest = tempfile.mkstemp(
+                prefix=prefix,
+                suffix=".infected",
+                dir=self.quarantine_dir,
+            )
 
-            shutil.move(file_path, dest)
-            os.chmod(dest, 0o000)
+            while True:
+                chunk = os.read(source_fd, 1024 * 1024)
+                if not chunk:
+                    break
+                view = memoryview(chunk)
+                while view:
+                    written = os.write(dest_fd, view)
+                    if written <= 0:
+                        raise OSError("short write while creating quarantine copy")
+                    view = view[written:]
+
+            os.fchown(dest_fd, 0, 0)
+            os.fchmod(dest_fd, 0o600)
+            os.fsync(dest_fd)
+            dest_complete = True
+
+            os.close(dest_fd)
+            dest_fd = None
+            os.close(source_fd)
+            source_fd = None
+
+            try:
+                current_stat = os.lstat(file_path)
+            except FileNotFoundError:
+                current_stat = None
+
+            if current_stat is not None:
+                if (
+                    current_stat.st_dev != opened_stat.st_dev
+                    or current_stat.st_ino != opened_stat.st_ino
+                    or not stat.S_ISREG(current_stat.st_mode)
+                ):
+                    self.logger.error(
+                        "Quarantine secured a private copy, but the source path "
+                        f"changed before removal: {file_path}"
+                    )
+                    return
+                os.unlink(file_path)
 
             self.logger.info(f"Quarantined to: {dest}")
             self.notifier.send_notification(
@@ -292,11 +378,30 @@ class ClamAVScanner:
         except FileNotFoundError:
             # The file may vanish quickly (e.g., /tmp temp files). This is normal.
             self.logger.info(f"Quarantine skipped (file vanished): {file_path}")
-            return
         except OSError as e:
             if getattr(e, 'errno', None) == 2:
                 self.logger.info(f"Quarantine skipped (file vanished): {file_path}")
-                return
-            self.logger.error(f"Quarantine failed: {e}")
+            else:
+                self.logger.error(f"Quarantine failed: {e}")
         except Exception as e:
             self.logger.error(f"Quarantine failed: {e}")
+        finally:
+            if source_fd is not None:
+                try:
+                    os.close(source_fd)
+                except OSError:
+                    pass
+            if dest_fd is not None:
+                try:
+                    os.close(dest_fd)
+                except OSError:
+                    pass
+            if dest and not dest_complete:
+                try:
+                    os.unlink(dest)
+                except FileNotFoundError:
+                    pass
+                except OSError as e:
+                    self.logger.error(
+                        f"Failed to remove incomplete quarantine copy {dest}: {e}"
+                    )
