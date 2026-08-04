@@ -1,0 +1,37 @@
+[Unit]
+Description=Herodium controlled Maltrail IOC trail update
+Documentation=https://github.com/ramnezer/herodium
+After=network-online.target maltrail-sensor.service
+Wants=network-online.target
+ConditionPathExists=/opt/maltrail/core/update.py
+ConditionFileNotEmpty=/etc/maltrail/herodium-maltrail.env
+
+[Service]
+Type=oneshot
+User=root
+UMask=0077
+RuntimeDirectory=herodium-maltrail-update
+RuntimeDirectoryMode=0700
+ExecStart=/usr/local/sbin/herodium-maltrail-update
+TimeoutStartSec=2100
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+MemoryHigh=1500M
+MemoryMax=2G
+TasksMax=64
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/maltrail /var/lib/herodium/supply-chain /run/herodium-maltrail-update
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=true
+MemoryDenyWriteExecute=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target

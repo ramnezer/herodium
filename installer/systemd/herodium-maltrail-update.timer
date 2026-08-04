@@ -1,0 +1,12 @@
+[Unit]
+Description=Daily Herodium controlled Maltrail IOC trail update
+
+[Timer]
+OnActiveSec=20min
+OnUnitActiveSec=24h
+RandomizedDelaySec=2h
+AccuracySec=15min
+Unit=herodium-maltrail-update.service
+
+[Install]
+WantedBy=timers.target
