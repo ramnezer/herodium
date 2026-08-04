@@ -135,7 +135,8 @@ class SupplyChainInstallerContractTests(unittest.TestCase):
         content = README.read_text(encoding="utf-8")
 
         self.assertIn("does not install Maltrail from a moving branch", content)
-        self.assertIn("upstream feed downloads disabled by default", content)
+        self.assertIn("sensor starts with `--offline`", content)
+        self.assertIn("herodium-maltrail-update.timer", content)
         self.assertIn("`/opt/maltrail.previous`", content)
 
 
