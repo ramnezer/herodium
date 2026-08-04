@@ -241,6 +241,84 @@ class ClamAVScanContractTests(unittest.TestCase):
         with self.assertRaisesRegex(TypeError, "inspect result.status explicitly"):
             bool(result)
 
+    def test_quarantine_normalizes_root_ownership_and_private_modes(self):
+        scanner = self._scanner(None)
+        scanner.notifier = Mock()
+
+        with tempfile.TemporaryDirectory() as temp_root:
+            root = Path(temp_root)
+            source = root / "infected.bin"
+            quarantine = root / "quarantine"
+            source.write_bytes(b"infected")
+            scanner.quarantine_dir = str(quarantine)
+
+            with (
+                patch.object(av_scanner_module.os, "chown") as chown,
+                patch.object(av_scanner_module.os, "fchown") as fchown,
+            ):
+                scanner._quarantine(str(source), "Test.Signature")
+
+            quarantined = list(quarantine.iterdir())
+            self.assertEqual(len(quarantined), 1)
+            destination = quarantined[0]
+            self.assertEqual(destination.read_bytes(), b"infected")
+            self.assertFalse(source.exists())
+            self.assertEqual(quarantine.stat().st_mode & 0o777, 0o700)
+            self.assertEqual(destination.stat().st_mode & 0o777, 0o600)
+            chown.assert_called_once_with(str(quarantine), 0, 0)
+            fchown.assert_called_once()
+            self.assertEqual(fchown.call_args.args[1:], (0, 0))
+            scanner.notifier.send_notification.assert_called_once()
+
+    def test_quarantine_rejects_symlink_source_without_touching_target(self):
+        scanner = self._scanner(None)
+        scanner.notifier = Mock()
+
+        with tempfile.TemporaryDirectory() as temp_root:
+            root = Path(temp_root)
+            target = root / "target.bin"
+            source = root / "infected-link"
+            quarantine = root / "quarantine"
+            target.write_bytes(b"keep")
+            source.symlink_to(target)
+            scanner.quarantine_dir = str(quarantine)
+
+            scanner._quarantine(str(source), "Test.Signature")
+
+            self.assertTrue(source.is_symlink())
+            self.assertEqual(target.read_bytes(), b"keep")
+            self.assertFalse(quarantine.exists())
+            scanner.notifier.send_notification.assert_not_called()
+            self.logger.error.assert_called_with(
+                f"Quarantine refused non-regular source path: {source}"
+            )
+
+    def test_quarantine_hardening_failure_removes_incomplete_copy(self):
+        scanner = self._scanner(None)
+        scanner.notifier = Mock()
+
+        with tempfile.TemporaryDirectory() as temp_root:
+            root = Path(temp_root)
+            source = root / "infected.bin"
+            quarantine = root / "quarantine"
+            source.write_bytes(b"infected")
+            scanner.quarantine_dir = str(quarantine)
+
+            with (
+                patch.object(av_scanner_module.os, "chown"),
+                patch.object(
+                    av_scanner_module.os,
+                    "fchown",
+                    side_effect=PermissionError("simulated chown failure"),
+                ),
+            ):
+                scanner._quarantine(str(source), "Test.Signature")
+
+            self.assertEqual(list(quarantine.iterdir()), [])
+            self.assertTrue(source.exists())
+            scanner.notifier.send_notification.assert_not_called()
+            self.logger.error.assert_called()
+
 
 if __name__ == "__main__":
     unittest.main()
