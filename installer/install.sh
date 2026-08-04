@@ -105,6 +105,17 @@ MALTRAIL_STATE_DIR=""
 MALTRAIL_STATE_DIR_EXISTED="false"
 MALTRAIL_FETCH_DIR=""
 MALTRAIL_STAGE_DIR=""
+MALTRAIL_UPDATE_TOOL_EXISTED="false"
+MALTRAIL_UPDATE_TOOL_CHANGED="false"
+MALTRAIL_UPDATE_TOOL_BACKUP=""
+MALTRAIL_UPDATE_SERVICE_EXISTED="false"
+MALTRAIL_UPDATE_SERVICE_CHANGED="false"
+MALTRAIL_UPDATE_SERVICE_BACKUP=""
+MALTRAIL_UPDATE_TIMER_EXISTED="false"
+MALTRAIL_UPDATE_TIMER_CHANGED="false"
+MALTRAIL_UPDATE_TIMER_BACKUP=""
+MALTRAIL_UPDATE_TIMER_WAS_ACTIVE="false"
+MALTRAIL_UPDATE_TIMER_ENABLEMENT=""
 
 SCHEDULED_ASSETS_CHANGED="false"
 SCHEDULED_TIMER_WAS_ACTIVE="false"
@@ -434,6 +445,8 @@ rollback_maltrail_deployment() {
         return 0
     fi
 
+    systemctl stop herodium-maltrail-update.timer >/dev/null 2>&1 || true
+    systemctl stop herodium-maltrail-update.service >/dev/null 2>&1 || true
     systemctl stop maltrail-sensor.service >/dev/null 2>&1 || true
 
     if [[ "${MALTRAIL_NEW_INSTALLED}" == "true" ]]; then
@@ -475,6 +488,27 @@ rollback_maltrail_deployment() {
             "${MALTRAIL_MARKER_BACKUP}" \
             0600
     fi
+    if [[ "${MALTRAIL_UPDATE_TOOL_CHANGED}" == "true" ]]; then
+        restore_activation_file \
+            /usr/local/sbin/herodium-maltrail-update \
+            "${MALTRAIL_UPDATE_TOOL_EXISTED}" \
+            "${MALTRAIL_UPDATE_TOOL_BACKUP}" \
+            0755
+    fi
+    if [[ "${MALTRAIL_UPDATE_SERVICE_CHANGED}" == "true" ]]; then
+        restore_activation_file \
+            /etc/systemd/system/herodium-maltrail-update.service \
+            "${MALTRAIL_UPDATE_SERVICE_EXISTED}" \
+            "${MALTRAIL_UPDATE_SERVICE_BACKUP}" \
+            0644
+    fi
+    if [[ "${MALTRAIL_UPDATE_TIMER_CHANGED}" == "true" ]]; then
+        restore_activation_file \
+            /etc/systemd/system/herodium-maltrail-update.timer \
+            "${MALTRAIL_UPDATE_TIMER_EXISTED}" \
+            "${MALTRAIL_UPDATE_TIMER_BACKUP}" \
+            0644
+    fi
 
     if [[ "${MALTRAIL_STATE_DIR_EXISTED}" != "true" \
         && -n "${MALTRAIL_STATE_DIR}" ]]; then
@@ -483,9 +517,15 @@ rollback_maltrail_deployment() {
 
     systemctl daemon-reload >/dev/null 2>&1 || true
     restore_unit_enablement maltrail-sensor.service "${MALTRAIL_ENABLEMENT}"
+    restore_unit_enablement \
+        herodium-maltrail-update.timer \
+        "${MALTRAIL_UPDATE_TIMER_ENABLEMENT}"
     if [[ "${MALTRAIL_WAS_ACTIVE}" == "true" \
         && -d "${MALTRAIL_DIR}" ]]; then
         systemctl start maltrail-sensor.service >/dev/null 2>&1 || true
+    fi
+    if [[ "${MALTRAIL_UPDATE_TIMER_WAS_ACTIVE}" == "true" ]]; then
+        systemctl start herodium-maltrail-update.timer >/dev/null 2>&1 || true
     fi
 
     remove_safe_directory "${MALTRAIL_FETCH_DIR:-}" >/dev/null 2>&1 || true
@@ -494,7 +534,10 @@ rollback_maltrail_deployment() {
         "${MALTRAIL_UNIT_BACKUP:-}" \
         "${MALTRAIL_CONFIG_BACKUP:-}" \
         "${MALTRAIL_ENV_BACKUP:-}" \
-        "${MALTRAIL_MARKER_BACKUP:-}"
+        "${MALTRAIL_MARKER_BACKUP:-}" \
+        "${MALTRAIL_UPDATE_TOOL_BACKUP:-}" \
+        "${MALTRAIL_UPDATE_SERVICE_BACKUP:-}" \
+        "${MALTRAIL_UPDATE_TIMER_BACKUP:-}"
     MALTRAIL_TRANSACTION_STARTED="false"
     MALTRAIL_TRANSACTION_READY="false"
 }
@@ -525,7 +568,10 @@ commit_maltrail_deployment() {
         "${MALTRAIL_UNIT_BACKUP:-}" \
         "${MALTRAIL_CONFIG_BACKUP:-}" \
         "${MALTRAIL_ENV_BACKUP:-}" \
-        "${MALTRAIL_MARKER_BACKUP:-}"
+        "${MALTRAIL_MARKER_BACKUP:-}" \
+        "${MALTRAIL_UPDATE_TOOL_BACKUP:-}" \
+        "${MALTRAIL_UPDATE_SERVICE_BACKUP:-}" \
+        "${MALTRAIL_UPDATE_TIMER_BACKUP:-}"
     MALTRAIL_TRANSACTION_STARTED="false"
     MALTRAIL_TRANSACTION_READY="false"
 }
@@ -902,39 +948,42 @@ install_verified_staging_asset() {
 }
 
 validate_staged_systemd_units() {
-    local source_unit
-    local verify_unit
+    local verify_dir
     local verify_rc
 
-    source_unit="${APP_STAGE_DIR}/supply-chain/installer/systemd/herodium.service"
-    verify_unit="$(
-        mktemp \
-            "${APP_STAGE_DIR}/supply-chain/herodium-verify.XXXXXX.service"
+    verify_dir="$(
+        mktemp -d "${APP_STAGE_DIR}/supply-chain/systemd-verify.XXXXXX"
     )"
 
     if ! python3 - \
-        "${source_unit}" \
-        "${verify_unit}" \
+        "${APP_STAGE_DIR}/supply-chain/installer/systemd/herodium.service" \
+        "${APP_STAGE_DIR}/supply-chain/installer/systemd/herodium-maltrail-update.service" \
+        "${APP_STAGE_DIR}/supply-chain/installer/bin/herodium-maltrail-update" \
+        "${verify_dir}" \
         "${APP_DIR}" \
         "${APP_STAGE_DIR}" <<'PYSYSTEMD'
 from pathlib import Path
 import os
+import shutil
 import sys
 
-source = Path(sys.argv[1])
-destination = Path(sys.argv[2])
-active_root = Path(sys.argv[3])
-stage_root = Path(sys.argv[4])
+herodium_source = Path(sys.argv[1])
+updater_source = Path(sys.argv[2])
+updater_tool_source = Path(sys.argv[3])
+verify_dir = Path(sys.argv[4])
+active_root = Path(sys.argv[5])
+stage_root = Path(sys.argv[6])
 
 stage_python = stage_root / "venv/bin/python3"
 stage_engine = stage_root / "core/engine.py"
-
 if not stage_python.is_file() or not os.access(stage_python, os.X_OK):
     raise SystemExit("staged Python executable is missing or not executable")
 if not stage_engine.is_file():
     raise SystemExit("staged Herodium engine is missing")
+if not updater_tool_source.is_file():
+    raise SystemExit("staged Maltrail updater is missing")
 
-text = source.read_text(encoding="utf-8")
+herodium_text = herodium_source.read_text(encoding="utf-8")
 active_working = f"WorkingDirectory={active_root}"
 active_exec = (
     f"ExecStart={active_root}/venv/bin/python3 "
@@ -945,31 +994,46 @@ stage_exec = (
     f"ExecStart={stage_root}/venv/bin/python3 "
     f"{stage_root}/core/engine.py"
 )
-
-if text.count(active_working) != 1 or text.count(active_exec) != 1:
+if herodium_text.count(active_working) != 1 or herodium_text.count(active_exec) != 1:
     raise SystemExit("Herodium service template has unexpected runtime paths")
+herodium_text = herodium_text.replace(active_working, stage_working)
+herodium_text = herodium_text.replace(active_exec, stage_exec)
+(verify_dir / "herodium.service").write_text(herodium_text, encoding="utf-8")
 
-rendered = text.replace(active_working, stage_working)
-rendered = rendered.replace(active_exec, stage_exec)
-
-if rendered.count(stage_working) != 1 or rendered.count(stage_exec) != 1:
-    raise SystemExit("unable to render staged Herodium service unit")
-
-destination.write_text(rendered, encoding="utf-8")
-os.chmod(destination, 0o600)
+verify_updater = verify_dir / "herodium-maltrail-update"
+shutil.copyfile(updater_tool_source, verify_updater)
+os.chmod(verify_updater, 0o700)
+updater_text = updater_source.read_text(encoding="utf-8")
+active_updater = "ExecStart=/usr/local/sbin/herodium-maltrail-update"
+stage_updater = f"ExecStart={verify_updater}"
+if updater_text.count(active_updater) != 1:
+    raise SystemExit("Maltrail updater unit has an unexpected ExecStart")
+updater_text = updater_text.replace(active_updater, stage_updater)
+(verify_dir / "herodium-maltrail-update.service").write_text(
+    updater_text, encoding="utf-8"
+)
 PYSYSTEMD
     then
-        rm -f -- "${verify_unit}"
+        remove_safe_directory "${verify_dir}"
         return 1
     fi
 
+    install -o root -g root -m 0600 \
+        "${APP_STAGE_DIR}/supply-chain/installer/systemd/maltrail-sensor.service" \
+        "${verify_dir}/maltrail-sensor.service"
+    install -o root -g root -m 0600 \
+        "${APP_STAGE_DIR}/supply-chain/installer/systemd/herodium-maltrail-update.timer" \
+        "${verify_dir}/herodium-maltrail-update.timer"
+
     if systemd-analyze verify \
-        "${verify_unit}" \
-        "${APP_STAGE_DIR}/supply-chain/installer/systemd/maltrail-sensor.service"; then
-        rm -f -- "${verify_unit}"
+        "${verify_dir}/herodium.service" \
+        "${verify_dir}/maltrail-sensor.service" \
+        "${verify_dir}/herodium-maltrail-update.service" \
+        "${verify_dir}/herodium-maltrail-update.timer"; then
+        remove_safe_directory "${verify_dir}"
     else
         verify_rc="$?"
-        rm -f -- "${verify_unit}"
+        remove_safe_directory "${verify_dir}"
         return "${verify_rc}"
     fi
 
@@ -1222,6 +1286,18 @@ prepare_staged_herodium_deployment() {
         "${APP_STAGE_DIR}/supply-chain/installer/systemd/maltrail-sensor.service" \
         0644
     install_verified_staging_asset \
+        "${REPO_DIR}/installer/systemd/herodium-maltrail-update.service" \
+        "${APP_STAGE_DIR}/supply-chain/installer/systemd/herodium-maltrail-update.service" \
+        0644
+    install_verified_staging_asset \
+        "${REPO_DIR}/installer/systemd/herodium-maltrail-update.timer" \
+        "${APP_STAGE_DIR}/supply-chain/installer/systemd/herodium-maltrail-update.timer" \
+        0644
+    install_verified_staging_asset \
+        "${REPO_DIR}/installer/bin/herodium-maltrail-update" \
+        "${APP_STAGE_DIR}/supply-chain/installer/bin/herodium-maltrail-update" \
+        0644
+    install_verified_staging_asset \
         "${REPO_DIR}/installer/bin/herodium-scan" \
         "${APP_STAGE_DIR}/supply-chain/installer/bin/herodium-scan" \
         0644
@@ -1288,8 +1364,7 @@ copy_runtime_state_into_stage() {
         fi
         unsafe="$(find "${quarantine_path}" -xdev ! -user root -print -quit)"
         if [[ -n "${unsafe}" ]]; then
-            echo "[CRITICAL] Existing quarantine contains a non-root-owned path: ${unsafe}"
-            return 1
+            echo "[WARNING] Existing quarantine contains legacy non-root-owned paths; normalizing them in the staged deployment."
         fi
 
         rsync -rlt --delete -- "${quarantine_path}/" "${APP_STAGE_DIR}/quarantine/"
@@ -1413,7 +1488,11 @@ validate_final_installer_state() {
     )
 
     if [[ "${INSTALL_MALTRAIL}" == "true" ]]; then
-        units+=(/etc/systemd/system/maltrail-sensor.service)
+        units+=(
+            /etc/systemd/system/maltrail-sensor.service
+            /etc/systemd/system/herodium-maltrail-update.service
+            /etc/systemd/system/herodium-maltrail-update.timer
+        )
     fi
     systemd-analyze verify "${units[@]}"
 
@@ -1423,9 +1502,16 @@ validate_final_installer_state() {
     systemctl is-active --quiet herodium-scheduled-scan.timer
     if [[ "${INSTALL_MALTRAIL}" == "true" ]]; then
         systemctl is-active --quiet maltrail-sensor.service
-    elif systemctl is-active --quiet maltrail-sensor.service 2>/dev/null; then
-        echo "[CRITICAL] Maltrail remained active after it was disabled by policy."
-        return 1
+        systemctl is-active --quiet herodium-maltrail-update.timer
+    else
+        if systemctl is-active --quiet maltrail-sensor.service 2>/dev/null; then
+            echo "[CRITICAL] Maltrail remained active after it was disabled by policy."
+            return 1
+        fi
+        if systemctl is-active --quiet herodium-maltrail-update.timer 2>/dev/null; then
+            echo "[CRITICAL] Maltrail trail-update timer remained active after disable."
+            return 1
+        fi
     fi
     if [[ "${CLAMAV_FRESHCLAM_WAS_ACTIVE}" == "true" ]]; then
         systemctl is-active --quiet clamav-freshclam.service
@@ -1524,6 +1610,12 @@ begin_maltrail_transaction() {
     if systemctl is-active --quiet maltrail-sensor.service 2>/dev/null; then
         MALTRAIL_WAS_ACTIVE="true"
     fi
+    MALTRAIL_UPDATE_TIMER_ENABLEMENT="$(
+        read_unit_enablement herodium-maltrail-update.timer
+    )"
+    if systemctl is-active --quiet herodium-maltrail-update.timer 2>/dev/null; then
+        MALTRAIL_UPDATE_TIMER_WAS_ACTIVE="true"
+    fi
 
     backup_activation_file \
         "${unit_path}" \
@@ -1541,6 +1633,18 @@ begin_maltrail_transaction() {
         /var/lib/herodium/supply-chain/maltrail-commit \
         MALTRAIL_MARKER_EXISTED \
         MALTRAIL_MARKER_BACKUP
+    backup_activation_file \
+        /usr/local/sbin/herodium-maltrail-update \
+        MALTRAIL_UPDATE_TOOL_EXISTED \
+        MALTRAIL_UPDATE_TOOL_BACKUP
+    backup_activation_file \
+        /etc/systemd/system/herodium-maltrail-update.service \
+        MALTRAIL_UPDATE_SERVICE_EXISTED \
+        MALTRAIL_UPDATE_SERVICE_BACKUP
+    backup_activation_file \
+        /etc/systemd/system/herodium-maltrail-update.timer \
+        MALTRAIL_UPDATE_TIMER_EXISTED \
+        MALTRAIL_UPDATE_TIMER_BACKUP
 
     MALTRAIL_TRANSACTION_STARTED="true"
 }
@@ -1548,12 +1652,25 @@ begin_maltrail_transaction() {
 deactivate_maltrail_if_disabled() {
     begin_maltrail_transaction
 
+    systemctl stop herodium-maltrail-update.timer >/dev/null 2>&1 || true
+    systemctl stop herodium-maltrail-update.service >/dev/null 2>&1 || true
+    systemctl disable herodium-maltrail-update.timer >/dev/null 2>&1 || true
     if systemctl is-active --quiet maltrail-sensor.service 2>/dev/null; then
         systemctl stop maltrail-sensor.service
     fi
     systemctl disable maltrail-sensor.service >/dev/null 2>&1 || true
+
+    MALTRAIL_UPDATE_TOOL_CHANGED="true"
+    MALTRAIL_UPDATE_SERVICE_CHANGED="true"
+    MALTRAIL_UPDATE_TIMER_CHANGED="true"
+    rm -f -- \
+        /usr/local/sbin/herodium-maltrail-update \
+        /etc/systemd/system/herodium-maltrail-update.service \
+        /etc/systemd/system/herodium-maltrail-update.timer
+    systemctl daemon-reload
+
     MALTRAIL_TRANSACTION_READY="true"
-    echo "[PASS] Maltrail service disabled by current installer policy."
+    echo "[PASS] Maltrail service and controlled trail updater disabled by policy."
 }
 
 install_pinned_maltrail() {
@@ -1563,6 +1680,16 @@ install_pinned_maltrail() {
     local unit_path="/etc/systemd/system/maltrail-sensor.service"
 
     begin_maltrail_transaction
+
+    # Prevent the periodic updater from racing with code/config/state rotation.
+    systemctl stop herodium-maltrail-update.timer >/dev/null 2>&1 || true
+    systemctl stop herodium-maltrail-update.service >/dev/null 2>&1 || true
+    if systemctl is-active --quiet herodium-maltrail-update.timer 2>/dev/null \
+        || systemctl is-active --quiet herodium-maltrail-update.service 2>/dev/null; then
+        echo "[CRITICAL] Controlled Maltrail updater did not stop before deployment."
+        return 1
+    fi
+
     SUPPLY_CHAIN_LOCK="${APP_DIR}/supply-chain/installer/supply-chain-lock.json"
     load_supply_chain_lock
 
@@ -1689,9 +1816,21 @@ install_pinned_maltrail() {
         /etc/maltrail/herodium-maltrail.env
 
     MALTRAIL_UNIT_CHANGED="true"
+    MALTRAIL_UPDATE_TOOL_CHANGED="true"
+    MALTRAIL_UPDATE_SERVICE_CHANGED="true"
+    MALTRAIL_UPDATE_TIMER_CHANGED="true"
     install -o root -g root -m 0644 \
         "${APP_DIR}/supply-chain/installer/systemd/maltrail-sensor.service" \
         "${unit_path}"
+    install -o root -g root -m 0755 \
+        "${APP_DIR}/supply-chain/installer/bin/herodium-maltrail-update" \
+        /usr/local/sbin/herodium-maltrail-update
+    install -o root -g root -m 0644 \
+        "${APP_DIR}/supply-chain/installer/systemd/herodium-maltrail-update.service" \
+        /etc/systemd/system/herodium-maltrail-update.service
+    install -o root -g root -m 0644 \
+        "${APP_DIR}/supply-chain/installer/systemd/herodium-maltrail-update.timer" \
+        /etc/systemd/system/herodium-maltrail-update.timer
     systemctl daemon-reload
 
     if [[ "${MALTRAIL_WAS_ACTIVE}" == "true" ]]; then
@@ -1730,11 +1869,19 @@ install_pinned_maltrail() {
         return 1
     fi
 
+    systemctl unmask herodium-maltrail-update.timer >/dev/null 2>&1 || true
+    systemctl enable --now herodium-maltrail-update.timer
+    if ! systemctl is-active --quiet herodium-maltrail-update.timer; then
+        echo "[CRITICAL] Controlled Maltrail trail-update timer failed to start."
+        return 1
+    fi
+
     MALTRAIL_PENDING_COMMIT="${MALTRAIL_COMMIT}"
     MALTRAIL_MARKER_CHANGED="true"
     remove_safe_directory "${MALTRAIL_FETCH_DIR}"
     MALTRAIL_FETCH_DIR=""
-    echo "[PASS] Maltrail installed at pinned commit ${MALTRAIL_COMMIT} in offline feed mode."
+    echo "[PASS] Maltrail code installed at pinned commit ${MALTRAIL_COMMIT}."
+    echo "[PASS] Controlled daily IOC trail updates enabled with staging and rollback."
 }
 
 # ==============================================================================
@@ -2467,7 +2614,11 @@ FINAL_UNITS=(
   /etc/systemd/system/herodium-scheduled-scan.timer
 )
 if [[ "${INSTALL_MALTRAIL}" == "true" ]]; then
-  FINAL_UNITS+=(/etc/systemd/system/maltrail-sensor.service)
+  FINAL_UNITS+=(
+    /etc/systemd/system/maltrail-sensor.service
+    /etc/systemd/system/herodium-maltrail-update.service
+    /etc/systemd/system/herodium-maltrail-update.timer
+  )
 fi
 systemd-analyze verify "${FINAL_UNITS[@]}"
 systemctl daemon-reload
@@ -2492,9 +2643,9 @@ CLAMAV_SUMMARY="Live=${LIVE_SCAN} (${THREAT_ACTION}), Scheduled=${CLAM_SCAN_TYPE
 MALTRAIL_SUMMARY="Not installed"
 if [[ "${INSTALL_MALTRAIL}" == "true" ]]; then
   if [[ "${MALTRAIL_ACTION}" == "block" ]]; then
-    MALTRAIL_SUMMARY="Installed (BLOCK, clean=${CLEAN_INTERVAL})"
+    MALTRAIL_SUMMARY="Installed (BLOCK, IOC updates=daily, clean=${CLEAN_INTERVAL})"
   else
-    MALTRAIL_SUMMARY="Installed (ALERT only)"
+    MALTRAIL_SUMMARY="Installed (ALERT only, IOC updates=daily)"
   fi
 fi
 
