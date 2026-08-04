@@ -1,0 +1,648 @@
+#!/usr/bin/env python3
+"""Safely refresh Maltrail IOC trails while keeping Maltrail code pinned."""
+
+from __future__ import annotations
+
+import ast
+import csv
+import fcntl
+import hashlib
+import json
+import os
+import shutil
+import stat
+import subprocess  # nosec B404 - fixed absolute command vectors only
+import sys
+import tempfile
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Final
+
+MALTRAIL_ROOT: Final = Path("/opt/maltrail")
+MALTRAIL_CONFIG: Final = Path("/etc/maltrail/maltrail.conf")
+MALTRAIL_ENV: Final = Path("/etc/maltrail/herodium-maltrail.env")
+MALTRAIL_STATE_BASE: Final = Path("/var/lib/maltrail")
+METADATA_PATH: Final = Path(
+    "/var/lib/herodium/supply-chain/maltrail-trails.json"
+)
+LOCK_PATH: Final = Path("/run/herodium-maltrail-update/lock")
+SYSTEMCTL: Final = "/usr/bin/systemctl"
+PYTHON: Final = "/usr/bin/python3"
+UPDATE_TIMEOUT_SECONDS: Final = 1800
+START_TIMEOUT_SECONDS: Final = 60
+MIN_TRAIL_ROWS: Final = 10_000
+MAX_TRAIL_ROWS: Final = 5_000_000
+MAX_TRAIL_BYTES: Final = 512 * 1024 * 1024
+MIN_CURRENT_RATIO: Final = 0.50
+MAX_FIELD_LENGTH: Final = 16_384
+
+
+class UpdateError(RuntimeError):
+    """Raised when a safe trail update cannot be completed."""
+
+
+def _mode(path: Path) -> int:
+    return stat.S_IMODE(path.lstat().st_mode)
+
+
+def _require_safe_regular_file(path: Path) -> None:
+    try:
+        info = path.lstat()
+    except FileNotFoundError as exc:
+        raise UpdateError(f"required file is missing: {path}") from exc
+
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        raise UpdateError(f"path is not a safe regular file: {path}")
+    if info.st_uid != 0:
+        raise UpdateError(f"file must be owned by root: {path}")
+    if _mode(path) & 0o022:
+        raise UpdateError(f"file must not be group/world-writable: {path}")
+
+
+def _require_safe_directory(path: Path, *, private: bool = False) -> None:
+    try:
+        info = path.lstat()
+    except FileNotFoundError as exc:
+        raise UpdateError(f"required directory is missing: {path}") from exc
+
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise UpdateError(f"path is not a safe directory: {path}")
+    if info.st_uid != 0:
+        raise UpdateError(f"directory must be owned by root: {path}")
+    mode = _mode(path)
+    if mode & 0o022:
+        raise UpdateError(f"directory must not be group/world-writable: {path}")
+    if private and mode & 0o077:
+        raise UpdateError(f"directory must be private: {path}")
+
+
+def _harden_private_root_directory(path: Path) -> None:
+    """Create or safely tighten a root-owned directory to mode 0700."""
+    if not path.exists():
+        try:
+            path.mkdir(mode=0o700)
+        except FileExistsError:
+            pass
+        except OSError as exc:
+            raise UpdateError(f"unable to create private directory: {path}") from exc
+
+        try:
+            os.chown(path, 0, 0, follow_symlinks=False)
+        except OSError as exc:
+            raise UpdateError(f"unable to set directory ownership: {path}") from exc
+
+    flags = os.O_RDONLY
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_DIRECTORY", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise UpdateError(f"unable to open safe directory: {path}") from exc
+
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISDIR(info.st_mode):
+            raise UpdateError(f"path is not a safe directory: {path}")
+        if info.st_uid != 0:
+            raise UpdateError(f"directory must be owned by root: {path}")
+
+        mode = stat.S_IMODE(info.st_mode)
+        if mode & 0o022:
+            raise UpdateError(
+                f"directory must not be group/world-writable: {path}"
+            )
+
+        try:
+            os.fchmod(descriptor, 0o700)
+        except OSError as exc:
+            raise UpdateError(f"unable to make directory private: {path}") from exc
+
+        final_info = os.fstat(descriptor)
+        if final_info.st_uid != 0 or stat.S_IMODE(final_info.st_mode) != 0o700:
+            raise UpdateError(f"directory hardening did not persist: {path}")
+    finally:
+        os.close(descriptor)
+
+
+def _parse_environment_file(path: Path) -> dict[str, str]:
+    _require_safe_regular_file(path)
+    values: dict[str, str] = {}
+
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            raise UpdateError(f"invalid environment line in {path}: {raw_line!r}")
+        key, value = line.split("=", 1)
+        if key not in {"HOME", "HERODIUM_MALTRAIL_COMMIT"}:
+            raise UpdateError(f"unexpected environment key in {path}: {key}")
+        if not value or "\x00" in value or "\n" in value:
+            raise UpdateError(f"invalid environment value for {key}")
+        values[key] = value
+
+    if set(values) != {"HOME", "HERODIUM_MALTRAIL_COMMIT"}:
+        raise UpdateError(f"incomplete Maltrail environment file: {path}")
+    return values
+
+
+def _validate_state_home(values: dict[str, str]) -> tuple[Path, str]:
+    commit = values["HERODIUM_MALTRAIL_COMMIT"]
+    if len(commit) != 40 or any(character not in "0123456789abcdef" for character in commit):
+        raise UpdateError("invalid pinned Maltrail commit marker")
+
+    expected = MALTRAIL_STATE_BASE / f"offline-{commit}"
+    state_home = Path(values["HOME"])
+    if state_home != expected:
+        raise UpdateError(
+            f"unexpected Maltrail HOME: expected {expected}, got {state_home}"
+        )
+    _require_safe_directory(MALTRAIL_STATE_BASE, private=True)
+    _require_safe_directory(state_home, private=True)
+    return state_home, commit
+
+
+def _extract_literal_url(path: Path) -> str | None:
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    except (OSError, SyntaxError, UnicodeError):
+        return None
+
+    for node in tree.body:
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        if not any(isinstance(target, ast.Name) and target.id == "__url__" for target in targets):
+            continue
+        value = node.value
+        if isinstance(value, ast.Constant) and isinstance(value.value, str):
+            return value.value.strip()
+        return None
+    return None
+
+
+def _literal_strings(value: ast.AST | None) -> list[str] | None:
+    if isinstance(value, ast.Constant) and isinstance(value.value, str):
+        return [value.value.strip()]
+    if isinstance(value, (ast.List, ast.Tuple, ast.Set)):
+        values: list[str] = []
+        for element in value.elts:
+            if not isinstance(element, ast.Constant) or not isinstance(
+                element.value, str
+            ):
+                return None
+            values.append(element.value.strip())
+        return values
+    return None
+
+
+def _feed_module_is_https_only(path: Path) -> bool:
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    except (OSError, SyntaxError, UnicodeError):
+        return False
+
+    primary = _extract_literal_url(path)
+    if primary is None or not primary.lower().startswith("https://"):
+        return False
+
+    for node in tree.body:
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        names = [
+            target.id.lower()
+            for target in targets
+            if isinstance(target, ast.Name)
+        ]
+        if not any("url" in name for name in names):
+            continue
+        values = _literal_strings(node.value)
+        if values is None:
+            return False
+        if any(not value.lower().startswith("https://") for value in values):
+            return False
+    return True
+
+
+def _disabled_insecure_feeds() -> list[str]:
+    feeds_dir = MALTRAIL_ROOT / "trails/feeds"
+    _require_safe_directory(feeds_dir)
+    disabled: list[str] = []
+
+    for path in sorted(feeds_dir.glob("*.py")):
+        if path.name == "__init__.py":
+            continue
+        _require_safe_regular_file(path)
+        if not _feed_module_is_https_only(path):
+            disabled.append(path.stem)
+    return disabled
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _validate_trails(path: Path, *, minimum_rows: int) -> tuple[int, int, str]:
+    try:
+        info = path.lstat()
+    except FileNotFoundError as exc:
+        raise UpdateError(f"candidate trails file is missing: {path}") from exc
+
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        raise UpdateError(f"candidate trails path is not a regular file: {path}")
+    if info.st_uid != 0:
+        raise UpdateError(f"candidate trails file is not root-owned: {path}")
+    if info.st_size <= 0 or info.st_size > MAX_TRAIL_BYTES:
+        raise UpdateError(
+            f"candidate trails size is outside safe bounds: {info.st_size}"
+        )
+
+    row_count = 0
+    try:
+        with path.open("r", encoding="utf-8", newline="") as handle:
+            reader = csv.reader(handle)
+            for row in reader:
+                row_count += 1
+                if row_count > MAX_TRAIL_ROWS:
+                    raise UpdateError("candidate trails row count exceeds safe maximum")
+                if len(row) != 3:
+                    raise UpdateError(
+                        f"candidate trails row {row_count} does not have 3 columns"
+                    )
+                if any(not field or "\x00" in field for field in row):
+                    raise UpdateError(
+                        f"candidate trails row {row_count} contains an empty/NUL field"
+                    )
+                if any(len(field) > MAX_FIELD_LENGTH for field in row):
+                    raise UpdateError(
+                        f"candidate trails row {row_count} exceeds field limits"
+                    )
+    except (csv.Error, UnicodeError, OSError) as exc:
+        raise UpdateError(f"unable to parse candidate trails: {exc}") from exc
+
+    if row_count < minimum_rows:
+        raise UpdateError(
+            f"candidate trails row count {row_count} is below required {minimum_rows}"
+        )
+    return row_count, info.st_size, _sha256(path)
+
+
+def _run(command: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(  # nosec B603 - absolute executable and fixed argument vectors
+        command,
+        check=check,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        timeout=START_TIMEOUT_SECONDS,
+    )
+
+
+def _sensor_active() -> bool:
+    result = _run(
+        [SYSTEMCTL, "is-active", "--quiet", "maltrail-sensor.service"],
+        check=False,
+    )
+    return result.returncode == 0
+
+
+def _restart_sensor_and_wait() -> None:
+    result = _run(
+        [SYSTEMCTL, "restart", "maltrail-sensor.service"],
+        check=False,
+    )
+    if result.returncode != 0:
+        raise UpdateError(f"Maltrail restart failed: {result.stdout.strip()}")
+
+    deadline = time.monotonic() + START_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        active = _run(
+            [SYSTEMCTL, "is-active", "--quiet", "maltrail-sensor.service"],
+            check=False,
+        )
+        pid = _run(
+            [
+                SYSTEMCTL,
+                "show",
+                "maltrail-sensor.service",
+                "-p",
+                "MainPID",
+                "--value",
+            ],
+            check=False,
+        )
+        if active.returncode == 0 and pid.stdout.strip().isdigit() and pid.stdout.strip() != "0":
+            return
+        time.sleep(1)
+    raise UpdateError("Maltrail did not become healthy after trail activation")
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _atomic_copy(source: Path, destination: Path, mode: int) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary_fd, temporary_name = tempfile.mkstemp(
+        prefix=f".{destination.name}.", dir=str(destination.parent)
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(temporary_fd, "wb") as output, source.open("rb") as input_handle:
+            shutil.copyfileobj(input_handle, output, length=1024 * 1024)
+            output.flush()
+            os.fsync(output.fileno())
+        os.chmod(temporary, mode)
+        os.chown(temporary, 0, 0)
+        os.replace(temporary, destination)
+        _fsync_directory(destination.parent)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def _write_metadata(
+    *,
+    commit: str,
+    rows: int,
+    size: int,
+    digest: str,
+    disabled_feeds: list[str],
+    changed: bool,
+) -> None:
+    metadata_root = METADATA_PATH.parent.parent
+    if metadata_root.exists():
+        _require_safe_directory(metadata_root)
+    else:
+        metadata_root.mkdir(mode=0o700)
+        os.chown(metadata_root, 0, 0)
+    if METADATA_PATH.parent.exists():
+        _require_safe_directory(METADATA_PATH.parent, private=True)
+    else:
+        METADATA_PATH.parent.mkdir(mode=0o700)
+        os.chown(METADATA_PATH.parent, 0, 0)
+    payload = {
+        "schema_version": 1,
+        "maltrail_commit": commit,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "trails_sha256": digest,
+        "rows": rows,
+        "bytes": size,
+        "changed": changed,
+        "transport_policy": "https-only-feed-modules",
+        "disabled_insecure_feeds": disabled_feeds,
+    }
+    temporary_fd, temporary_name = tempfile.mkstemp(
+        prefix=".maltrail-trails.", dir=str(METADATA_PATH.parent)
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(temporary_fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, sort_keys=True, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, 0o600)
+        os.chown(temporary, 0, 0)
+        os.replace(temporary, METADATA_PATH)
+        _fsync_directory(METADATA_PATH.parent)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def _build_candidate(stage_home: Path, disabled_feeds: list[str]) -> Path:
+    embedded = r'''
+import os
+import ssl
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+sys.path.insert(0, "/opt/maltrail")
+from core import common as common_module
+from core import update as update_module
+from core.settings import config, read_config
+
+# Maltrail's updater supports self-signed custom feeds by globally disabling
+# TLS verification. Herodium restores certificate validation and uses only
+# HTTPS feed modules from the pinned Maltrail code snapshot.
+ssl._create_default_https_context = ssl.create_default_context
+
+class HTTPSOnlyRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request, fp, code, msg, headers, newurl):
+        if not newurl.lower().startswith("https://"):
+            raise urllib.error.URLError("refusing non-HTTPS feed redirect")
+        return super().redirect_request(request, fp, code, msg, headers, newurl)
+
+urllib.request.install_opener(urllib.request.build_opener(HTTPSOnlyRedirect))
+
+_original_retrieve_content = common_module.retrieve_content
+
+def https_only_retrieve_content(url, *args, **kwargs):
+    scheme = urllib.parse.urlsplit(str(url)).scheme.lower()
+    if scheme != "https":
+        raise ValueError("refusing non-HTTPS Maltrail feed URL")
+    return _original_retrieve_content(url, *args, **kwargs)
+
+# Patch both references: feed modules import from core.common at runtime, while
+# core.update imported its own reference when the pinned module was loaded.
+common_module.retrieve_content = https_only_retrieve_content
+update_module.retrieve_content = https_only_retrieve_content
+update_trails = update_module.update_trails
+
+read_config("/etc/maltrail/maltrail.conf")
+config.offline = False
+config.USE_FEED_UPDATES = True
+config.UPDATE_SERVER = ""
+config.CUSTOM_TRAILS_URL = ""
+config.CUSTOM_TRAILS_DIR = "./trails/custom"
+config.TRAILS_FILE = os.path.join(os.path.expanduser("~"), ".maltrail", "trails.csv")
+existing = set(filter(None, str(config.DISABLED_FEEDS or "").replace(",", " ").split()))
+existing.update(filter(None, os.environ.get("HERODIUM_DISABLED_FEEDS", "").split(",")))
+config.DISABLED_FEEDS = ",".join(sorted(existing))
+trails = update_trails(force=True, offline=False)
+if not trails:
+    raise SystemExit("no trails were generated")
+print("[PASS] Maltrail updater generated %d trails" % len(trails))
+'''
+    environment = os.environ.copy()
+    environment.pop("PYTHONPATH", None)
+    environment.pop("PYTHONHOME", None)
+    environment.update(
+        {
+            "HOME": str(stage_home),
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "SUDO_UID": "0",
+            "SUDO_GID": "0",
+            "HERODIUM_DISABLED_FEEDS": ",".join(disabled_feeds),
+        }
+    )
+    try:
+        result = subprocess.run(  # nosec B603 - pinned Python and fixed script
+            [PYTHON, "-c", embedded],
+            cwd=MALTRAIL_ROOT,
+            env=environment,
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=UPDATE_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise UpdateError("Maltrail trail refresh exceeded its time limit") from exc
+
+    print(result.stdout, end="")
+    if result.returncode != 0:
+        raise UpdateError(
+            f"Maltrail trail refresh failed with exit code {result.returncode}"
+        )
+    return stage_home / ".maltrail/trails.csv"
+
+
+def update_trails() -> None:
+    if os.geteuid() != 0:
+        raise UpdateError("this updater must run as root")
+
+    _require_safe_directory(MALTRAIL_ROOT)
+    _require_safe_regular_file(MALTRAIL_ROOT / "sensor.py")
+    _require_safe_regular_file(MALTRAIL_ROOT / "core/update.py")
+    _require_safe_regular_file(MALTRAIL_CONFIG)
+    values = _parse_environment_file(MALTRAIL_ENV)
+    state_home, commit = _validate_state_home(values)
+    disabled_feeds = _disabled_insecure_feeds()
+
+    trails_dir = state_home / ".maltrail"
+    _harden_private_root_directory(trails_dir)
+    current = trails_dir / "trails.csv"
+    current_rows = 0
+    current_digest = ""
+    if current.exists():
+        current_rows, _, current_digest = _validate_trails(
+            current, minimum_rows=1
+        )
+
+    minimum_rows = max(
+        MIN_TRAIL_ROWS,
+        int(current_rows * MIN_CURRENT_RATIO) if current_rows else 0,
+    )
+    stage_home = Path(
+        tempfile.mkdtemp(prefix=".herodium-trails-stage-", dir=MALTRAIL_STATE_BASE)
+    )
+    os.chmod(stage_home, 0o700)
+    os.chown(stage_home, 0, 0)
+
+    try:
+        candidate = _build_candidate(stage_home, disabled_feeds)
+        rows, size, digest = _validate_trails(
+            candidate, minimum_rows=minimum_rows
+        )
+        if digest == current_digest:
+            _write_metadata(
+                commit=commit,
+                rows=rows,
+                size=size,
+                digest=digest,
+                disabled_feeds=disabled_feeds,
+                changed=False,
+            )
+            print(
+                f"[PASS] Maltrail trails are already current: rows={rows} sha256={digest}"
+            )
+            return
+
+        active_before = _sensor_active()
+        backup = trails_dir / "trails.csv.previous"
+        if backup.exists():
+            _require_safe_regular_file(backup)
+        if current.exists():
+            _atomic_copy(current, backup, 0o600)
+
+        _atomic_copy(candidate, current, 0o600)
+        try:
+            if active_before:
+                _restart_sensor_and_wait()
+            _write_metadata(
+                commit=commit,
+                rows=rows,
+                size=size,
+                digest=digest,
+                disabled_feeds=disabled_feeds,
+                changed=True,
+            )
+        except Exception:
+            if backup.exists():
+                _atomic_copy(backup, current, 0o600)
+            else:
+                current.unlink(missing_ok=True)
+            if active_before:
+                try:
+                    _restart_sensor_and_wait()
+                except Exception as rollback_error:
+                    raise UpdateError(
+                        "new trails failed and rollback could not restore Maltrail"
+                    ) from rollback_error
+            raise
+
+        print(
+            f"[PASS] Maltrail trails updated atomically: rows={rows} bytes={size} "
+            f"sha256={digest}"
+        )
+    finally:
+        shutil.rmtree(stage_home, ignore_errors=True)
+
+
+def main() -> int:
+    try:
+        if LOCK_PATH.parent.exists():
+            _require_safe_directory(LOCK_PATH.parent, private=True)
+        else:
+            LOCK_PATH.parent.mkdir(mode=0o700)
+            os.chown(LOCK_PATH.parent, 0, 0)
+    except (OSError, UpdateError) as exc:
+        print(f"[CRITICAL] Unable to prepare updater lock directory: {exc}", file=sys.stderr)
+        return 1
+
+    flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(LOCK_PATH, flags, 0o600)
+    except OSError as exc:
+        print(f"[CRITICAL] Unable to open updater lock safely: {exc}", file=sys.stderr)
+        return 1
+
+    with os.fdopen(descriptor, "a+", encoding="utf-8") as lock_handle:
+        os.fchmod(lock_handle.fileno(), 0o600)
+        try:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print("[INFO] Another Maltrail trail update is already running.")
+            return 0
+
+        try:
+            update_trails()
+        except UpdateError as exc:
+            print(f"[CRITICAL] {exc}", file=sys.stderr)
+            return 1
+        except Exception as exc:  # defensive boundary for a systemd oneshot
+            print(f"[CRITICAL] Unexpected Maltrail update failure: {exc}", file=sys.stderr)
+            return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
