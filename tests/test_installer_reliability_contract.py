@@ -170,7 +170,9 @@ class InstallerReliabilityContractTests(unittest.TestCase):
 
     def test_final_unit_verification_is_dynamic_and_sleep_removed(self):
         self.assertIn("FINAL_UNITS=(", self.content)
-        self.assertIn("FINAL_UNITS+=(/etc/systemd/system/maltrail-sensor.service)", self.content)
+        self.assertIn("/etc/systemd/system/maltrail-sensor.service", self.content)
+        self.assertIn("/etc/systemd/system/herodium-maltrail-update.service", self.content)
+        self.assertIn("/etc/systemd/system/herodium-maltrail-update.timer", self.content)
         self.assertIn('systemd-analyze verify "${FINAL_UNITS[@]}"', self.content)
         self.assertNotIn("sleep 120", self.content)
 
