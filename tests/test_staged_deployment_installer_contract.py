@@ -183,8 +183,10 @@ class StagedDeploymentInstallerContractTests(unittest.TestCase):
         content = INSTALLER.read_text(encoding="utf-8")
         renderer_match = re.search(
             r"python3 - \\\n"
-            r'        "\$\{source_unit\}" \\\n'
-            r'        "\$\{verify_unit\}" \\\n'
+            r'        "\$\{APP_STAGE_DIR\}/supply-chain/installer/systemd/herodium.service" \\\n'
+            r'        "\$\{APP_STAGE_DIR\}/supply-chain/installer/systemd/herodium-maltrail-update.service" \\\n'
+            r'        "\$\{APP_STAGE_DIR\}/supply-chain/installer/bin/herodium-maltrail-update" \\\n'
+            r'        "\$\{verify_dir\}" \\\n'
             r'        "\$\{APP_DIR\}" \\\n'
             r'        "\$\{APP_STAGE_DIR\}" <<\'PYSYSTEMD\'\n'
             r"(?P<script>.*?)\nPYSYSTEMD",
@@ -197,9 +199,12 @@ class StagedDeploymentInstallerContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary_directory:
             temporary_root = Path(temporary_directory)
             stage = temporary_root / "herodium.stage"
-            source_unit = temporary_root / "herodium.service"
-            rendered_unit = temporary_root / "rendered.service"
-            renderer_path = temporary_root / "render_unit.py"
+            verify_dir = temporary_root / "verify"
+            verify_dir.mkdir()
+            herodium_source = temporary_root / "herodium.service"
+            updater_source = temporary_root / "herodium-maltrail-update.service"
+            updater_tool = temporary_root / "herodium-maltrail-update"
+            renderer_path = temporary_root / "render_units.py"
 
             (stage / "venv/bin").mkdir(parents=True)
             (stage / "core").mkdir()
@@ -208,20 +213,30 @@ class StagedDeploymentInstallerContractTests(unittest.TestCase):
                 "print('fresh-install-stage')\n",
                 encoding="utf-8",
             )
-            source_unit.write_text(
+            herodium_source.write_text(
                 (
                     PROJECT_ROOT / "installer/systemd/herodium.service"
                 ).read_text(encoding="utf-8"),
                 encoding="utf-8",
             )
+            updater_source.write_text(
+                (
+                    PROJECT_ROOT
+                    / "installer/systemd/herodium-maltrail-update.service"
+                ).read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
+            updater_tool.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
             renderer_path.write_text(renderer_script, encoding="utf-8")
 
             original_argv = sys.argv
             try:
                 sys.argv = [
                     str(renderer_path),
-                    str(source_unit),
-                    str(rendered_unit),
+                    str(herodium_source),
+                    str(updater_source),
+                    str(updater_tool),
+                    str(verify_dir),
                     "/opt/herodium",
                     str(stage),
                 ]
@@ -229,7 +244,9 @@ class StagedDeploymentInstallerContractTests(unittest.TestCase):
             finally:
                 sys.argv = original_argv
 
-            rendered = rendered_unit.read_text(encoding="utf-8")
+            rendered = (verify_dir / "herodium.service").read_text(
+                encoding="utf-8"
+            )
             self.assertIn(f"WorkingDirectory={stage}", rendered)
             self.assertIn(
                 f"ExecStart={stage}/venv/bin/python3 {stage}/core/engine.py",
@@ -239,7 +256,17 @@ class StagedDeploymentInstallerContractTests(unittest.TestCase):
                 "ExecStart=/opt/herodium/venv/bin/python3",
                 rendered,
             )
-            self.assertEqual(rendered_unit.stat().st_mode & 0o777, 0o600)
+            rendered_updater = (
+                verify_dir / "herodium-maltrail-update.service"
+            ).read_text(encoding="utf-8")
+            self.assertIn(
+                f"ExecStart={verify_dir}/herodium-maltrail-update",
+                rendered_updater,
+            )
+            self.assertEqual(
+                (verify_dir / "herodium-maltrail-update").stat().st_mode & 0o777,
+                0o700,
+            )
 
         function = content.split(
             "validate_staged_systemd_units() {",
@@ -248,7 +275,11 @@ class StagedDeploymentInstallerContractTests(unittest.TestCase):
             "run_staged_pip() {",
             1,
         )[0]
-        self.assertIn('systemd-analyze verify \\\n        "${verify_unit}"', function)
+        self.assertIn('"${verify_dir}/herodium.service"', function)
+        self.assertIn(
+            '"${verify_dir}/herodium-maltrail-update.service"',
+            function,
+        )
         self.assertNotIn(
             'systemd-analyze verify \\\n'
             '        "${APP_STAGE_DIR}/supply-chain/installer/systemd/herodium.service"',
@@ -290,7 +321,24 @@ class StagedDeploymentInstallerContractTests(unittest.TestCase):
         self.assertLess(quiesce, state_copy)
         self.assertLess(state_copy, activation)
         self.assertIn("Existing quarantine contains an unsupported path", content)
-        self.assertIn("Existing quarantine contains a non-root-owned path", content)
+        self.assertNotIn(
+            "Existing quarantine contains a non-root-owned path",
+            content,
+        )
+        self.assertIn(
+            "Existing quarantine contains legacy non-root-owned paths; "
+            "normalizing them in the staged deployment.",
+            content,
+        )
+        self.assertIn(
+            'chown -R root:root "${APP_STAGE_DIR}/quarantine"',
+            content,
+        )
+        self.assertIn(
+            'find "${APP_STAGE_DIR}/quarantine" -xdev -type f '
+            '-exec chmod 0600 {} +',
+            content,
+        )
 
     def test_activation_is_atomic_and_keeps_previous_deployment(self):
         content = INSTALLER.read_text(encoding="utf-8")
@@ -339,6 +387,9 @@ class StagedDeploymentInstallerContractTests(unittest.TestCase):
         for relative_path in (
             "systemd/herodium.service",
             "systemd/maltrail-sensor.service",
+            "systemd/herodium-maltrail-update.service",
+            "systemd/herodium-maltrail-update.timer",
+            "bin/herodium-maltrail-update",
             "bin/herodium-scan",
             "bin/herodium-top",
             "bin/herodium-rkhunter-baseline",
