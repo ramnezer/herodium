@@ -101,10 +101,13 @@ Herodium currently focuses on these areas:
 │   └── requirements.txt
 ├── installer/
 │   ├── bin/
+│   │   ├── herodium-maltrail-update
 │   │   ├── herodium-rkhunter-baseline
 │   │   ├── herodium-scan
 │   │   └── herodium-top
 │   ├── systemd/
+│   │   ├── herodium-maltrail-update.service
+│   │   ├── herodium-maltrail-update.timer
 │   │   ├── herodium.service
 │   │   └── maltrail-sensor.service
 │   ├── install.sh
@@ -123,6 +126,7 @@ Herodium currently focuses on these areas:
     ├── test_herodium_top.py
     ├── test_installer_reliability_contract.py
     ├── test_ips_manager.py
+    ├── test_maltrail_update.py
     ├── test_memory_hunter.py
     ├── test_network_monitor.py
     ├── test_notifier.py
@@ -274,10 +278,13 @@ Depending on your selections, the installer may configure:
 - Python virtual environment under `/opt/herodium/venv`
 - main service:
   - `herodium.service`
-- optional Maltrail sensor service:
+- optional Maltrail services:
   - `maltrail-sensor.service`
+  - `herodium-maltrail-update.service`
+  - `herodium-maltrail-update.timer`
   - code pinned by `installer/supply-chain-lock.json`
-  - upstream feed downloads disabled by default (`--offline`)
+  - sensor-side downloads disabled (`--offline`)
+  - controlled IOC trail refresh performed daily through staging and rollback
 - scheduled ClamAV scan service and timer:
   - `herodium-scheduled-scan.service`
   - `herodium-scheduled-scan.timer`
@@ -325,11 +332,40 @@ health check. The prior `/opt/maltrail` deployment is retained as
 `/opt/maltrail.previous` for immediate rollback.
 
 The sensor starts with `--offline` and uses an explicit root-owned configuration
-at `/etc/maltrail/maltrail.conf`. Runtime trail state is isolated under a path
-that contains the pinned commit, preventing earlier online feed state from
-silently influencing the deterministic deployment. Live feed updates are not
-part of the default installer path because remote feed contents are not pinned
-by the Herodium release.
+at `/etc/maltrail/maltrail.conf`. This keeps packet capture isolated from network
+retrieval and prevents the long-running sensor from modifying its own inputs.
+Runtime trail state remains namespaced by the pinned code commit.
+
+IOC trails are refreshed separately by `herodium-maltrail-update.timer`, once
+per 24 hours with a randomized delay. The updater executes only the feed modules
+from the pinned Maltrail code snapshot, disables feed modules that do not expose
+an HTTPS URL, restores normal TLS certificate verification, and rejects custom
+remote/update-server inputs for the automated path.
+
+Each refresh is built under a private staging HOME. The resulting CSV must pass
+strict UTF-8/CSV validation, bounded row and file-size limits, and a
+catastrophic-shrink guard relative to the currently active list. A valid
+candidate is copied atomically into the active state directory. If the sensor
+was running, it is restarted and must return with a non-zero MainPID; otherwise
+the previous `trails.csv` is restored automatically. The last successful
+metadata record is stored at:
+
+```text
+/var/lib/herodium/supply-chain/maltrail-trails.json
+```
+
+Run an immediate controlled refresh and inspect its timer with:
+
+```bash
+sudo herodium-maltrail-update
+sudo systemctl status herodium-maltrail-update.timer
+sudo journalctl -u herodium-maltrail-update.service
+```
+
+Maltrail source code still changes only through an explicit
+`supply-chain-lock.json` update and a new Herodium release. Trail data is
+therefore current and mutable, while executable code remains reviewed and
+immutable.
 
 ## Rkhunter Baseline Safety
 
