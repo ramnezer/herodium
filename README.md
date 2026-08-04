@@ -115,31 +115,6 @@ Herodium currently focuses on these areas:
 │   ├── supply-chain-lock.json
 │   └── uninstall.sh
 └── tests/
-    ├── test_apparmor_installer_contract.py
-    ├── test_apparmor_manager.py
-    ├── test_apparmor_state.py
-    ├── test_av_scanner.py
-    ├── test_clamav_installer_contract.py
-    ├── test_engine_health.py
-    ├── test_fs_monitor.py
-    ├── test_health.py
-    ├── test_herodium_top.py
-    ├── test_installer_reliability_contract.py
-    ├── test_ips_manager.py
-    ├── test_maltrail_update.py
-    ├── test_memory_hunter.py
-    ├── test_network_monitor.py
-    ├── test_notifier.py
-    ├── test_performance_manager.py
-    ├── test_rkhunter_baseline_contract.py
-    ├── test_rkhunter_manager.py
-    ├── test_scan_recovery.py
-    ├── test_scheduler.py
-    ├── test_staged_deployment_installer_contract.py
-    ├── test_supply_chain_installer_contract.py
-    ├── test_sys_hardener.py
-    ├── test_system_command.py
-    └── test_zram_manager.py
 ```
 
 ## Supported Environment
