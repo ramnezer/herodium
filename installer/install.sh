@@ -23,11 +23,28 @@ MALTRAIL_STATE_BASE="/var/lib/maltrail"
 MALTRAIL_REPOSITORY=""
 MALTRAIL_COMMIT=""
 MALTRAIL_LICENSE_SHA256=""
+FALCO_REPOSITORY=""
+FALCO_SUITE=""
+FALCO_COMPONENT=""
+FALCO_KEY_URL=""
+FALCO_TRUSTED_FINGERPRINT=""
+FALCO_PACKAGE_VERSION=""
+FALCO_DRIVER=""
+FALCO_STATE_DIR="/var/lib/herodium/falco"
+FALCO_CURSOR_PATH="${FALCO_STATE_DIR}/cursor.json"
+FALCO_MARKER_PATH="${FALCO_STATE_DIR}/ownership.json"
+FALCO_SOURCE_LIST="/etc/apt/sources.list.d/herodium-falco.list"
+FALCO_KEYRING="/usr/share/keyrings/herodium-falco-archive-keyring.gpg"
+FALCO_CONFIG_PATH="/etc/falco/config.d/herodium.yaml"
+FALCO_RULES_PATH="/etc/falco/rules.d/herodium-rules.yaml"
+FALCO_LOGROTATE_PATH="/etc/logrotate.d/herodium-falco"
+FALCO_INSTALLER_QUIESCED="false"
 
 # --- Defaults (avoid installer exit on CANCEL / unset choices) ---
 ENABLE_ZRAM="false"
 LIVE_SCAN="true"
 INSTALL_MALTRAIL="false"
+INSTALL_FALCO="false"
 MALTRAIL_ACTION="alert"
 CLEAN_INTERVAL="weekly"
 INSTALL_FAIL2BAN="false"
@@ -116,6 +133,39 @@ MALTRAIL_UPDATE_TIMER_CHANGED="false"
 MALTRAIL_UPDATE_TIMER_BACKUP=""
 MALTRAIL_UPDATE_TIMER_WAS_ACTIVE="false"
 MALTRAIL_UPDATE_TIMER_ENABLEMENT=""
+
+FALCO_TRANSACTION_STARTED="false"
+FALCO_MARKER_NEEDED="false"
+FALCO_PACKAGE_WAS_INSTALLED="false"
+FALCO_PACKAGE_CHANGED="false"
+FALCO_PACKAGE_MANAGED="false"
+FALCO_REPOSITORY_MANAGED="false"
+FALCO_HOLD_WAS_ACTIVE="false"
+FALCO_MODERN_WAS_ACTIVE="false"
+FALCO_MODERN_ENABLEMENT=""
+FALCO_FALCOCTL_WAS_ACTIVE="false"
+FALCO_FALCOCTL_ENABLEMENT=""
+FALCO_CONFIG_EXISTED="false"
+FALCO_CONFIG_CHANGED="false"
+FALCO_CONFIG_BACKUP=""
+FALCO_RULES_EXISTED="false"
+FALCO_RULES_CHANGED="false"
+FALCO_RULES_BACKUP=""
+FALCO_LOGROTATE_EXISTED="false"
+FALCO_LOGROTATE_CHANGED="false"
+FALCO_LOGROTATE_BACKUP=""
+FALCO_SOURCE_EXISTED="false"
+FALCO_SOURCE_CHANGED="false"
+FALCO_SOURCE_BACKUP=""
+FALCO_KEYRING_EXISTED="false"
+FALCO_KEYRING_CHANGED="false"
+FALCO_KEYRING_BACKUP=""
+FALCO_MARKER_EXISTED="false"
+FALCO_MARKER_CHANGED="false"
+FALCO_MARKER_BACKUP=""
+FALCO_KEY_TMP=""
+FALCO_GNUPG_HOME=""
+FALCO_KEY_EXPORT_TMP=""
 
 SCHEDULED_ASSETS_CHANGED="false"
 SCHEDULED_TIMER_WAS_ACTIVE="false"
@@ -673,7 +723,9 @@ handle_install_failure() {
             quiescing|quiesced|deploying|service_restarted|finalizing)
                 echo "[WARNING] Installation failed; rolling back installer-managed state."
                 systemctl stop herodium.service >/dev/null 2>&1 || true
+                cleanup_falco_cursor_after_failed_fresh_install || true
                 rollback_scheduled_scan_assets
+                rollback_falco_deployment
                 rollback_maltrail_deployment
                 rollback_clamav_configuration
                 rollback_herodium_deployment
@@ -732,9 +784,9 @@ try:
 except (OSError, UnicodeError, json.JSONDecodeError) as exc:
     raise SystemExit(f"invalid supply-chain lock: {exc}")
 
-if set(data) != {"schema_version", "maltrail"}:
+if set(data) != {"schema_version", "maltrail", "falco"}:
     raise SystemExit("unexpected top-level keys in supply-chain lock")
-if data["schema_version"] != 1:
+if data["schema_version"] != 2:
     raise SystemExit("unsupported supply-chain lock schema")
 
 maltrail = data["maltrail"]
@@ -758,7 +810,63 @@ if not isinstance(license_sha256, str) or re.fullmatch(
 ) is None:
     raise SystemExit("Maltrail license hash must be a lowercase SHA-256")
 
-print("\t".join((repository, commit, license_sha256)))
+falco = data["falco"]
+if not isinstance(falco, dict) or set(falco) != {
+    "repository",
+    "suite",
+    "component",
+    "key_url",
+    "trusted_fingerprint",
+    "package_version",
+    "driver",
+}:
+    raise SystemExit("unexpected Falco lock fields")
+
+falco_repository = falco["repository"]
+falco_suite = falco["suite"]
+falco_component = falco["component"]
+falco_key_url = falco["key_url"]
+falco_fingerprint = falco["trusted_fingerprint"]
+falco_package_version = falco["package_version"]
+falco_driver = falco["driver"]
+
+if falco_repository != "https://download.falco.org/packages/deb":
+    raise SystemExit("Falco repository is not the approved upstream")
+if falco_suite != "stable" or falco_component != "main":
+    raise SystemExit("Falco APT distribution is not the approved stable channel")
+if falco_key_url != "https://falco.org/repo/falcosecurity-packages.asc":
+    raise SystemExit("Falco signing-key URL is not the approved upstream")
+if not isinstance(falco_fingerprint, str) or re.fullmatch(
+    r"[0-9A-F]{40}", falco_fingerprint
+) is None:
+    raise SystemExit("Falco trusted fingerprint must be a full uppercase fingerprint")
+if falco_fingerprint != "478B2FBBC75F4237B731DA4365106822B35B1B1F":
+    raise SystemExit("Falco trusted fingerprint is not the approved signing key")
+if not isinstance(falco_package_version, str) or re.fullmatch(
+    r"[0-9]+[.][0-9]+[.][0-9]+", falco_package_version
+) is None:
+    raise SystemExit("Falco package version must be an exact semantic version")
+if falco_package_version != "0.44.1":
+    raise SystemExit("Falco package version is not the approved pinned version")
+if falco_driver != "modern_ebpf":
+    raise SystemExit("Falco driver must be pinned to modern_ebpf")
+
+print(
+    "\t".join(
+        (
+            repository,
+            commit,
+            license_sha256,
+            falco_repository,
+            falco_suite,
+            falco_component,
+            falco_key_url,
+            falco_fingerprint,
+            falco_package_version,
+            falco_driver,
+        )
+    )
+)
 PYLOCK
 )" || {
         echo "[CRITICAL] Unable to parse ${SUPPLY_CHAIN_LOCK}."
@@ -769,6 +877,13 @@ PYLOCK
         MALTRAIL_REPOSITORY \
         MALTRAIL_COMMIT \
         MALTRAIL_LICENSE_SHA256 \
+        FALCO_REPOSITORY \
+        FALCO_SUITE \
+        FALCO_COMPONENT \
+        FALCO_KEY_URL \
+        FALCO_TRUSTED_FINGERPRINT \
+        FALCO_PACKAGE_VERSION \
+        FALCO_DRIVER \
         <<< "${parsed}"
 }
 
@@ -1078,6 +1193,7 @@ update_staged_herodium_config() {
     HERODIUM_SCHED_THREAT_ACTION="${SCHED_THREAT_ACTION}" \
     HERODIUM_LIVE_SCAN="${LIVE_SCAN}" \
     HERODIUM_INSTALL_MALTRAIL="${INSTALL_MALTRAIL}" \
+    HERODIUM_INSTALL_FALCO="${INSTALL_FALCO}" \
     HERODIUM_MALTRAIL_ACTION="${MALTRAIL_ACTION}" \
     HERODIUM_CLEAN_INTERVAL="${CLEAN_INTERVAL}" \
     HERODIUM_INSTALL_FAIL2BAN="${INSTALL_FAIL2BAN}" \
@@ -1120,6 +1236,10 @@ config.setdefault("live_monitor", {})["enable"] = enabled("HERODIUM_LIVE_SCAN")
 
 maltrail = config.setdefault("maltrail", {})
 maltrail["enable"] = enabled("HERODIUM_INSTALL_MALTRAIL")
+
+falco = config.setdefault("falco", {})
+falco["enable"] = enabled("HERODIUM_INSTALL_FALCO")
+falco["mode"] = "alert_only"
 maltrail["block_traffic"] = os.environ["HERODIUM_MALTRAIL_ACTION"] == "block"
 maltrail["clean_interval_hours"] = (
     24 if os.environ["HERODIUM_CLEAN_INTERVAL"] == "daily" else 168
@@ -1238,6 +1358,7 @@ prepare_staged_herodium_deployment() {
 
     validate_installer_lock_file "${PYTHON_TOOLS_LOCK}" tools
     validate_installer_lock_file "${RUNTIME_REQUIREMENTS_LOCK}" runtime
+    load_supply_chain_lock
     validate_herodium_source_tree
     validate_existing_herodium_config
     create_herodium_source_manifest
@@ -1267,6 +1388,8 @@ prepare_staged_herodium_deployment() {
         "${APP_STAGE_DIR}/supply-chain" \
         "${APP_STAGE_DIR}/supply-chain/installer" \
         "${APP_STAGE_DIR}/supply-chain/installer/bin" \
+        "${APP_STAGE_DIR}/supply-chain/installer/falco" \
+        "${APP_STAGE_DIR}/supply-chain/installer/logrotate" \
         "${APP_STAGE_DIR}/supply-chain/installer/systemd"
 
     install_verified_staging_asset \
@@ -1276,6 +1399,18 @@ prepare_staged_herodium_deployment() {
     install_verified_staging_asset \
         "${SUPPLY_CHAIN_LOCK}" \
         "${APP_STAGE_DIR}/supply-chain/installer/supply-chain-lock.json" \
+        0644
+    install_verified_staging_asset \
+        "${REPO_DIR}/installer/falco/herodium-falco.yaml" \
+        "${APP_STAGE_DIR}/supply-chain/installer/falco/herodium-falco.yaml" \
+        0644
+    install_verified_staging_asset \
+        "${REPO_DIR}/installer/falco/herodium-falco-rules.yaml" \
+        "${APP_STAGE_DIR}/supply-chain/installer/falco/herodium-falco-rules.yaml" \
+        0644
+    install_verified_staging_asset \
+        "${REPO_DIR}/installer/logrotate/herodium-falco" \
+        "${APP_STAGE_DIR}/supply-chain/installer/logrotate/herodium-falco" \
         0644
     install_verified_staging_asset \
         "${REPO_DIR}/installer/systemd/herodium.service" \
@@ -1494,15 +1629,35 @@ validate_final_installer_state() {
             /etc/systemd/system/herodium-maltrail-update.timer
         )
     fi
-    systemd-analyze verify "${units[@]}"
+    if ! systemd-analyze verify "${units[@]}"; then
+        echo "[CRITICAL] Final systemd unit verification failed."
+        return 1
+    fi
 
-    systemctl is-active --quiet herodium.service
-    systemctl is-active --quiet clamav-daemon.service
-    systemctl is-active --quiet clamav-daemon.socket
-    systemctl is-active --quiet herodium-scheduled-scan.timer
+    require_active_unit herodium.service || return 1
+    require_active_unit clamav-daemon.service || return 1
+    require_active_unit clamav-daemon.socket || return 1
+    require_active_unit herodium-scheduled-scan.timer || return 1
+
+    if [[ "${INSTALL_FALCO}" == "true" ]]; then
+        if ! validate_falco_runtime_state; then
+            echo "[CRITICAL] Final Falco runtime validation failed."
+            return 1
+        fi
+        echo "[PASS] Final Falco runtime state validated."
+    else
+        if [[ "${FALCO_MARKER_EXISTED}" == "true" ]] \
+            && { [[ -e "${FALCO_CONFIG_PATH}" ]] \
+                || [[ -e "${FALCO_RULES_PATH}" ]] \
+                || [[ -e "${FALCO_LOGROTATE_PATH}" ]]; }; then
+            echo "[CRITICAL] Herodium Falco assets remained installed after disable."
+            return 1
+        fi
+    fi
+
     if [[ "${INSTALL_MALTRAIL}" == "true" ]]; then
-        systemctl is-active --quiet maltrail-sensor.service
-        systemctl is-active --quiet herodium-maltrail-update.timer
+        require_active_unit maltrail-sensor.service || return 1
+        require_active_unit herodium-maltrail-update.timer || return 1
     else
         if systemctl is-active --quiet maltrail-sensor.service 2>/dev/null; then
             echo "[CRITICAL] Maltrail remained active after it was disabled by policy."
@@ -1513,15 +1668,26 @@ validate_final_installer_state() {
             return 1
         fi
     fi
+
     if [[ "${CLAMAV_FRESHCLAM_WAS_ACTIVE}" == "true" ]]; then
-        systemctl is-active --quiet clamav-freshclam.service
+        require_active_unit clamav-freshclam.service || return 1
     fi
-    "${APP_DIR}/venv/bin/python3" -m pip check
-    (
+
+    if ! "${APP_DIR}/venv/bin/python3" -m pip check; then
+        echo "[CRITICAL] Final Herodium virtual-environment dependency check failed."
+        return 1
+    fi
+    if ! (
         cd "${APP_DIR}"
         sha256sum -c .herodium-deployment.sha256 >/dev/null
-    )
-    validate_previous_deployment_candidate
+    ); then
+        echo "[CRITICAL] Final Herodium deployment manifest verification failed."
+        return 1
+    fi
+    if ! validate_previous_deployment_candidate; then
+        echo "[CRITICAL] Previous Herodium rollback candidate validation failed."
+        return 1
+    fi
     echo "[PASS] Final installer service state validated."
 }
 
@@ -1549,6 +1715,7 @@ commit_herodium_deployment() {
     install -d -o root -g root -m 0700 "${DEPLOYMENT_MANIFEST_DIR}"
 
     # Persist all transaction metadata while rollback backups are still available.
+    persist_falco_ownership_marker
     persist_maltrail_commit_marker
     DEPLOYMENT_MANIFEST_CHANGED="true"
     manifest_temp="$(mktemp \
@@ -1561,6 +1728,7 @@ commit_herodium_deployment() {
     # No fallible deployment mutation occurs after this commit point.
     HERODIUM_DEPLOYMENT_COMMITTED="true"
     commit_scheduled_scan_assets
+    commit_falco_deployment
     commit_maltrail_deployment
     commit_clamav_configuration
 
@@ -1573,6 +1741,753 @@ commit_herodium_deployment() {
         "${DEPLOYMENT_MANIFEST_BACKUP:-}" \
         "${SOURCE_MANIFEST_TMP:-}"
     echo "[PASS] Installer-wide deployment transaction committed."
+}
+
+
+falco_package_is_installed() {
+    dpkg-query -W -f='${db:Status-Status}\n' falco 2>/dev/null \
+        | grep -Fx 'installed' >/dev/null
+}
+
+falco_package_version() {
+    dpkg-query -W -f='${Version}' falco 2>/dev/null
+}
+
+falco_package_is_held() {
+    apt-mark showhold 2>/dev/null | grep -Fx falco >/dev/null
+}
+
+validate_falco_ownership_marker() {
+    local mode
+
+    if [[ ! -e "${FALCO_MARKER_PATH}" ]]; then
+        return 1
+    fi
+    if [[ -L "${FALCO_MARKER_PATH}" || ! -f "${FALCO_MARKER_PATH}" ]]; then
+        echo "[CRITICAL] Falco ownership marker is not a safe regular file."
+        return 2
+    fi
+    if [[ "$(stat -c '%u' -- "${FALCO_MARKER_PATH}")" != "0" ]]; then
+        echo "[CRITICAL] Falco ownership marker must be owned by root."
+        return 2
+    fi
+    mode="$(stat -c '%a' -- "${FALCO_MARKER_PATH}")"
+    if (( (8#${mode}) & 0077 )); then
+        echo "[CRITICAL] Falco ownership marker must be private (0600)."
+        return 2
+    fi
+
+    python3 - "${FALCO_MARKER_PATH}" <<'PYFALCOMARKER'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+try:
+    data = json.loads(path.read_text(encoding="utf-8"))
+except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+    raise SystemExit(f"invalid Falco ownership marker: {exc}")
+
+expected = {
+    "schema_version",
+    "package_installed_by_herodium",
+    "repository_installed_by_herodium",
+}
+if set(data) != expected or data["schema_version"] != 1:
+    raise SystemExit("unexpected Falco ownership marker schema")
+for key in (
+    "package_installed_by_herodium",
+    "repository_installed_by_herodium",
+):
+    if not isinstance(data[key], bool):
+        raise SystemExit(f"Falco ownership marker field must be boolean: {key}")
+if data["package_installed_by_herodium"] != data["repository_installed_by_herodium"]:
+    raise SystemExit("Falco ownership marker has inconsistent package/repository ownership")
+PYFALCOMARKER
+}
+
+load_falco_ownership_marker() {
+    local parsed
+
+    if ! validate_falco_ownership_marker; then
+        return 1
+    fi
+    parsed="$(python3 - "${FALCO_MARKER_PATH}" <<'PYFALCOLOAD'
+import json
+import sys
+from pathlib import Path
+
+data = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+print(
+    "\t".join(
+        (
+            "true" if data["package_installed_by_herodium"] else "false",
+            "true" if data["repository_installed_by_herodium"] else "false",
+        )
+    )
+)
+PYFALCOLOAD
+)"
+    IFS=$'\t' read -r \
+        FALCO_PACKAGE_MANAGED \
+        FALCO_REPOSITORY_MANAGED \
+        <<< "${parsed}"
+}
+
+assert_unclaimed_falco_asset_slots() {
+    local path
+
+    if [[ "${FALCO_MARKER_EXISTED}" == "true" ]]; then
+        return 0
+    fi
+    for path in \
+        "${FALCO_CONFIG_PATH}" \
+        "${FALCO_RULES_PATH}" \
+        "${FALCO_LOGROTATE_PATH}" \
+        "${FALCO_SOURCE_LIST}" \
+        "${FALCO_KEYRING}"; do
+        if [[ -e "${path}" || -L "${path}" ]]; then
+            echo "[CRITICAL] Refusing to claim pre-existing Falco asset without Herodium ownership marker: ${path}"
+            return 1
+        fi
+    done
+}
+
+begin_falco_transaction() {
+    if [[ "${FALCO_TRANSACTION_STARTED}" == "true" ]]; then
+        return 0
+    fi
+
+    if [[ -e "${FALCO_MARKER_PATH}" || -L "${FALCO_MARKER_PATH}" ]]; then
+        validate_falco_ownership_marker || return 1
+        FALCO_MARKER_EXISTED="true"
+        load_falco_ownership_marker
+    fi
+
+    assert_unclaimed_falco_asset_slots
+
+    if falco_package_is_installed; then
+        FALCO_PACKAGE_WAS_INSTALLED="true"
+    fi
+    if falco_package_is_held; then
+        FALCO_HOLD_WAS_ACTIVE="true"
+    fi
+
+    FALCO_MODERN_ENABLEMENT="$(read_unit_enablement falco-modern-bpf.service)"
+    FALCO_FALCOCTL_ENABLEMENT="$(read_unit_enablement falcoctl-artifact-follow.service)"
+    if systemctl is-active --quiet falco-modern-bpf.service 2>/dev/null; then
+        FALCO_MODERN_WAS_ACTIVE="true"
+    fi
+    if systemctl is-active --quiet falcoctl-artifact-follow.service 2>/dev/null; then
+        FALCO_FALCOCTL_WAS_ACTIVE="true"
+    fi
+
+    backup_activation_file \
+        "${FALCO_CONFIG_PATH}" \
+        FALCO_CONFIG_EXISTED \
+        FALCO_CONFIG_BACKUP
+    backup_activation_file \
+        "${FALCO_RULES_PATH}" \
+        FALCO_RULES_EXISTED \
+        FALCO_RULES_BACKUP
+    backup_activation_file \
+        "${FALCO_LOGROTATE_PATH}" \
+        FALCO_LOGROTATE_EXISTED \
+        FALCO_LOGROTATE_BACKUP
+    backup_activation_file \
+        "${FALCO_SOURCE_LIST}" \
+        FALCO_SOURCE_EXISTED \
+        FALCO_SOURCE_BACKUP
+    backup_activation_file \
+        "${FALCO_KEYRING}" \
+        FALCO_KEYRING_EXISTED \
+        FALCO_KEYRING_BACKUP
+    backup_activation_file \
+        "${FALCO_MARKER_PATH}" \
+        FALCO_MARKER_EXISTED \
+        FALCO_MARKER_BACKUP
+
+    FALCO_TRANSACTION_STARTED="true"
+}
+
+restore_falco_runtime_state() {
+    if ! falco_package_is_installed; then
+        return 0
+    fi
+
+    if [[ "${FALCO_HOLD_WAS_ACTIVE}" == "true" ]]; then
+        apt-mark hold falco >/dev/null 2>&1 || true
+    else
+        apt-mark unhold falco >/dev/null 2>&1 || true
+    fi
+
+    restore_unit_enablement \
+        falcoctl-artifact-follow.service \
+        "${FALCO_FALCOCTL_ENABLEMENT}"
+    restore_unit_enablement \
+        falco-modern-bpf.service \
+        "${FALCO_MODERN_ENABLEMENT}"
+
+    if [[ "${FALCO_FALCOCTL_WAS_ACTIVE}" == "true" ]]; then
+        systemctl start falcoctl-artifact-follow.service >/dev/null 2>&1 || true
+    else
+        systemctl stop falcoctl-artifact-follow.service >/dev/null 2>&1 || true
+    fi
+    if [[ "${FALCO_MODERN_WAS_ACTIVE}" == "true" ]]; then
+        systemctl start falco-modern-bpf.service >/dev/null 2>&1 || true
+    else
+        systemctl stop falco-modern-bpf.service >/dev/null 2>&1 || true
+    fi
+}
+
+prepare_falco_cursor_for_fresh_install() {
+    if [[ "${INSTALL_FALCO}" != "true" \
+        || "${HERODIUM_CURRENT_ROTATED}" == "true" ]]; then
+        return 0
+    fi
+
+    ensure_safe_root_directory "${FALCO_STATE_DIR}" 0700
+    if [[ -L "${FALCO_CURSOR_PATH}" ]]; then
+        echo "[CRITICAL] Refusing a symlinked Falco reader cursor on fresh install."
+        return 1
+    fi
+    if [[ -e "${FALCO_CURSOR_PATH}" ]]; then
+        if [[ ! -f "${FALCO_CURSOR_PATH}" \
+            || "$(stat -c '%u' -- "${FALCO_CURSOR_PATH}")" != "0" ]]; then
+            echo "[CRITICAL] Existing Falco reader cursor is not a safe root-owned regular file."
+            return 1
+        fi
+        rm -f -- "${FALCO_CURSOR_PATH}"
+        echo "[INFO] Removed stale Falco reader cursor before fresh Herodium startup."
+    fi
+}
+
+cleanup_falco_cursor_after_failed_fresh_install() {
+    if [[ "${INSTALL_FALCO}" != "true" \
+        || "${HERODIUM_CURRENT_ROTATED}" == "true" ]]; then
+        return 0
+    fi
+    if [[ -L "${FALCO_STATE_DIR}" || ! -d "${FALCO_STATE_DIR}" ]]; then
+        return 0
+    fi
+    if [[ -L "${FALCO_CURSOR_PATH}" ]]; then
+        echo "[WARNING] Refusing to remove a symlinked Falco reader cursor during rollback."
+        return 0
+    fi
+    if [[ -f "${FALCO_CURSOR_PATH}" \
+        && "$(stat -c '%u' -- "${FALCO_CURSOR_PATH}")" == "0" ]]; then
+        rm -f -- "${FALCO_CURSOR_PATH}"
+        echo "[INFO] Removed Falco reader cursor created by failed fresh installation."
+    fi
+}
+
+cleanup_falco_temporary_paths() {
+    rm -f -- "${FALCO_KEY_TMP:-}" "${FALCO_KEY_EXPORT_TMP:-}"
+    if [[ -n "${FALCO_GNUPG_HOME:-}" ]]; then
+        remove_safe_directory "${FALCO_GNUPG_HOME}" >/dev/null 2>&1 || true
+    fi
+    FALCO_KEY_TMP=""
+    FALCO_KEY_EXPORT_TMP=""
+    FALCO_GNUPG_HOME=""
+}
+
+rollback_falco_deployment() {
+    set +e
+
+    if [[ "${FALCO_TRANSACTION_STARTED}" != "true" ]]; then
+        return 0
+    fi
+
+    systemctl stop falco-modern-bpf.service >/dev/null 2>&1 || true
+    systemctl stop falcoctl-artifact-follow.service >/dev/null 2>&1 || true
+
+    if [[ "${FALCO_PACKAGE_CHANGED}" == "true" \
+        && "${FALCO_PACKAGE_WAS_INSTALLED}" != "true" ]]; then
+        apt-mark unhold falco >/dev/null 2>&1 || true
+        systemctl disable falco-modern-bpf.service >/dev/null 2>&1 || true
+        systemctl unmask falcoctl-artifact-follow.service >/dev/null 2>&1 || true
+        DEBIAN_FRONTEND=noninteractive apt-get purge -y falco >/dev/null 2>&1 || true
+    fi
+
+    if [[ "${FALCO_CONFIG_CHANGED}" == "true" ]]; then
+        restore_activation_file \
+            "${FALCO_CONFIG_PATH}" \
+            "${FALCO_CONFIG_EXISTED}" \
+            "${FALCO_CONFIG_BACKUP}" \
+            0644
+    fi
+    if [[ "${FALCO_RULES_CHANGED}" == "true" ]]; then
+        restore_activation_file \
+            "${FALCO_RULES_PATH}" \
+            "${FALCO_RULES_EXISTED}" \
+            "${FALCO_RULES_BACKUP}" \
+            0644
+    fi
+    if [[ "${FALCO_LOGROTATE_CHANGED}" == "true" ]]; then
+        restore_activation_file \
+            "${FALCO_LOGROTATE_PATH}" \
+            "${FALCO_LOGROTATE_EXISTED}" \
+            "${FALCO_LOGROTATE_BACKUP}" \
+            0644
+    fi
+    if [[ "${FALCO_SOURCE_CHANGED}" == "true" ]]; then
+        restore_activation_file \
+            "${FALCO_SOURCE_LIST}" \
+            "${FALCO_SOURCE_EXISTED}" \
+            "${FALCO_SOURCE_BACKUP}" \
+            0644
+    fi
+    if [[ "${FALCO_KEYRING_CHANGED}" == "true" ]]; then
+        restore_activation_file \
+            "${FALCO_KEYRING}" \
+            "${FALCO_KEYRING_EXISTED}" \
+            "${FALCO_KEYRING_BACKUP}" \
+            0644
+    fi
+    if [[ "${FALCO_MARKER_CHANGED}" == "true" ]]; then
+        restore_activation_file \
+            "${FALCO_MARKER_PATH}" \
+            "${FALCO_MARKER_EXISTED}" \
+            "${FALCO_MARKER_BACKUP}" \
+            0600
+    fi
+
+    if [[ "${FALCO_PACKAGE_WAS_INSTALLED}" == "true" ]]; then
+        restore_falco_runtime_state
+    fi
+
+    cleanup_falco_temporary_paths
+    rm -f -- \
+        "${FALCO_CONFIG_BACKUP:-}" \
+        "${FALCO_RULES_BACKUP:-}" \
+        "${FALCO_LOGROTATE_BACKUP:-}" \
+        "${FALCO_SOURCE_BACKUP:-}" \
+        "${FALCO_KEYRING_BACKUP:-}" \
+        "${FALCO_MARKER_BACKUP:-}"
+    FALCO_TRANSACTION_STARTED="false"
+    }
+
+persist_falco_ownership_marker() {
+    if [[ "${FALCO_TRANSACTION_STARTED}" != "true" \
+        || "${FALCO_MARKER_NEEDED}" != "true" ]]; then
+        return 0
+    fi
+
+    ensure_safe_root_directory "${FALCO_STATE_DIR}" 0700
+    # Mark the ownership file as transaction-modified before atomic replacement.
+    # This guarantees rollback even if the file replace succeeds but directory fsync fails.
+    FALCO_MARKER_CHANGED="true"
+    python3 - \
+        "${FALCO_MARKER_PATH}" \
+        "${FALCO_PACKAGE_MANAGED}" \
+        "${FALCO_REPOSITORY_MANAGED}" <<'PYFALCOWRITE'
+import json
+import os
+import sys
+import tempfile
+from pathlib import Path
+
+path = Path(sys.argv[1])
+package_managed = sys.argv[2] == "true"
+repository_managed = sys.argv[3] == "true"
+payload = {
+    "schema_version": 1,
+    "package_installed_by_herodium": package_managed,
+    "repository_installed_by_herodium": repository_managed,
+}
+encoded = (json.dumps(payload, sort_keys=True) + "\n").encode("utf-8")
+fd, temporary_name = tempfile.mkstemp(prefix=".ownership.", dir=path.parent)
+try:
+    os.fchmod(fd, 0o600)
+    with os.fdopen(fd, "wb", closefd=True) as handle:
+        handle.write(encoded)
+        handle.flush()
+        os.fsync(handle.fileno())
+    fd = -1
+    os.replace(temporary_name, path)
+    directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+except BaseException:
+    if fd >= 0:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+    try:
+        os.unlink(temporary_name)
+    except OSError:
+        pass
+    raise
+PYFALCOWRITE
+    chown root:root "${FALCO_MARKER_PATH}"
+    chmod 0600 "${FALCO_MARKER_PATH}"
+}
+
+commit_falco_deployment() {
+    cleanup_falco_temporary_paths
+    rm -f -- \
+        "${FALCO_CONFIG_BACKUP:-}" \
+        "${FALCO_RULES_BACKUP:-}" \
+        "${FALCO_LOGROTATE_BACKUP:-}" \
+        "${FALCO_SOURCE_BACKUP:-}" \
+        "${FALCO_KEYRING_BACKUP:-}" \
+        "${FALCO_MARKER_BACKUP:-}"
+    FALCO_TRANSACTION_STARTED="false"
+    }
+
+validate_preexisting_falco_compatibility() {
+    local actual_version
+    local modern_enablement
+    local falcoctl_enablement
+
+    actual_version="$(falco_package_version)"
+    if [[ "${actual_version}" != "${FALCO_PACKAGE_VERSION}" ]]; then
+        echo "[CRITICAL] Existing Falco version ${actual_version} does not match pinned version ${FALCO_PACKAGE_VERSION}."
+        return 1
+    fi
+    if ! falco_package_is_held; then
+        echo "[CRITICAL] Existing Falco must already be apt-held before Herodium can adopt it."
+        return 1
+    fi
+
+    modern_enablement="$(read_unit_enablement falco-modern-bpf.service)"
+    case "${modern_enablement}" in
+        enabled|enabled-runtime|linked|linked-runtime) ;;
+        *)
+            echo "[CRITICAL] Existing Falco must already use an enabled modern-eBPF service."
+            return 1
+            ;;
+    esac
+    if ! systemctl is-active --quiet falco-modern-bpf.service; then
+        echo "[CRITICAL] Existing Falco modern-eBPF service must already be active."
+        return 1
+    fi
+    if systemctl is-active --quiet falco-kmod.service 2>/dev/null \
+        || systemctl is-active --quiet falco-custom.service 2>/dev/null; then
+        echo "[CRITICAL] Existing Falco uses a non-modern-eBPF service; refusing takeover."
+        return 1
+    fi
+
+    falcoctl_enablement="$(read_unit_enablement falcoctl-artifact-follow.service)"
+    case "${falcoctl_enablement}" in
+        masked|masked-runtime) ;;
+        *)
+            echo "[CRITICAL] Existing Falco automatic artifact updates must already be masked."
+            return 1
+            ;;
+    esac
+    if systemctl is-active --quiet falcoctl-artifact-follow.service 2>/dev/null; then
+        echo "[CRITICAL] Existing Falco automatic artifact updater must not be active."
+        return 1
+    fi
+}
+
+install_verified_falco_repository() {
+    local fingerprint_count
+
+    apt-get install -y --no-install-recommends ca-certificates gnupg
+
+    FALCO_KEY_TMP="$(mktemp /run/herodium-falco-key.XXXXXX)"
+    FALCO_GNUPG_HOME="$(mktemp -d /run/herodium-falco-gnupg.XXXXXX)"
+    FALCO_KEY_EXPORT_TMP="$(mktemp /run/herodium-falco-keyring.XXXXXX)"
+    chmod 0700 "${FALCO_GNUPG_HOME}"
+
+    curl --fail --silent --show-error --location \
+        --proto '=https' --tlsv1.2 \
+        --output "${FALCO_KEY_TMP}" \
+        "${FALCO_KEY_URL}"
+
+    GNUPGHOME="${FALCO_GNUPG_HOME}" \
+        gpg --batch --no-options --import "${FALCO_KEY_TMP}" >/dev/null 2>&1
+    fingerprint_count="$(
+        GNUPGHOME="${FALCO_GNUPG_HOME}" \
+            gpg --batch --no-options --with-colons \
+                --fingerprint "${FALCO_TRUSTED_FINGERPRINT}" 2>/dev/null \
+            | awk -F: -v expected="${FALCO_TRUSTED_FINGERPRINT}" \
+                '$1 == "fpr" && $10 == expected { count += 1 } END { print count + 0 }'
+    )"
+    if [[ "${fingerprint_count}" != "1" ]]; then
+        echo "[CRITICAL] Falco signing-key fingerprint verification failed."
+        return 1
+    fi
+
+    GNUPGHOME="${FALCO_GNUPG_HOME}" \
+        gpg --batch --no-options --export "${FALCO_TRUSTED_FINGERPRINT}" \
+        > "${FALCO_KEY_EXPORT_TMP}"
+    if [[ ! -s "${FALCO_KEY_EXPORT_TMP}" ]]; then
+        echo "[CRITICAL] Falco trusted signing key export is empty."
+        return 1
+    fi
+
+    FALCO_KEYRING_CHANGED="true"
+    install -o root -g root -m 0644 \
+        "${FALCO_KEY_EXPORT_TMP}" "${FALCO_KEYRING}"
+
+    FALCO_SOURCE_CHANGED="true"
+    printf 'deb [signed-by=%s] %s %s %s\n' \
+        "${FALCO_KEYRING}" \
+        "${FALCO_REPOSITORY}" \
+        "${FALCO_SUITE}" \
+        "${FALCO_COMPONENT}" \
+        | install -o root -g root -m 0644 /dev/stdin "${FALCO_SOURCE_LIST}"
+
+    apt-get update -y
+    if ! apt-cache madison falco \
+        | awk '{print $3}' \
+        | grep -Fx "${FALCO_PACKAGE_VERSION}" >/dev/null; then
+        echo "[CRITICAL] Pinned Falco package version is unavailable from the verified repository."
+        return 1
+    fi
+}
+
+install_falco_managed_assets() {
+    ensure_safe_root_directory /etc/falco 0755
+    ensure_safe_root_directory /etc/falco/config.d 0755
+    ensure_safe_root_directory /etc/falco/rules.d 0755
+
+    FALCO_CONFIG_CHANGED="true"
+    install_verified_staging_asset \
+        "${APP_DIR}/supply-chain/installer/falco/herodium-falco.yaml" \
+        "${FALCO_CONFIG_PATH}" \
+        0644
+    FALCO_RULES_CHANGED="true"
+    install_verified_staging_asset \
+        "${APP_DIR}/supply-chain/installer/falco/herodium-falco-rules.yaml" \
+        "${FALCO_RULES_PATH}" \
+        0644
+    FALCO_LOGROTATE_CHANGED="true"
+    install_verified_staging_asset \
+        "${APP_DIR}/supply-chain/installer/logrotate/herodium-falco" \
+        "${FALCO_LOGROTATE_PATH}" \
+        0644
+
+    install -d -o root -g root -m 0700 /var/log/herodium
+    if [[ -L /var/log/herodium/falco-events.jsonl \
+        || ( -e /var/log/herodium/falco-events.jsonl \
+            && ! -f /var/log/herodium/falco-events.jsonl ) ]]; then
+        echo "[CRITICAL] Falco event log is not a safe regular file."
+        return 1
+    fi
+    if [[ -e /var/log/herodium/falco-events.jsonl \
+        && "$(stat -c '%u' -- /var/log/herodium/falco-events.jsonl)" != "0" ]]; then
+        echo "[CRITICAL] Falco event log must be owned by root."
+        return 1
+    fi
+    if [[ ! -e /var/log/herodium/falco-events.jsonl ]]; then
+        install -o root -g root -m 0600 \
+            /dev/null /var/log/herodium/falco-events.jsonl
+    else
+        chown root:root /var/log/herodium/falco-events.jsonl
+        chmod 0600 /var/log/herodium/falco-events.jsonl
+    fi
+
+    falco --validate "${FALCO_RULES_PATH}"
+}
+
+require_active_unit() {
+    local unit_name="$1"
+    local unit_state
+
+    unit_state="$(systemctl is-active "${unit_name}" 2>/dev/null || true)"
+    if [[ "${unit_state}" != "active" ]]; then
+        echo "[CRITICAL] Required systemd unit is not active: ${unit_name} (state=${unit_state:-unknown})."
+        systemctl status "${unit_name}" --no-pager || true
+        return 1
+    fi
+}
+
+require_safe_regular_file() {
+    local path="$1"
+    local label="$2"
+
+    if [[ ! -f "${path}" || -L "${path}" ]]; then
+        echo "[CRITICAL] ${label} is missing or is not a safe regular file: ${path}"
+        return 1
+    fi
+}
+
+quiesce_falco_for_installer_writes() {
+    if [[ "${FALCO_INSTALLER_QUIESCED}" == "true" ]]; then
+        return 0
+    fi
+    if [[ "${INSTALL_FALCO}" != "true" ]] || ! falco_package_is_installed; then
+        return 0
+    fi
+
+    if [[ "${FALCO_TRANSACTION_STARTED}" != "true" ]]; then
+        begin_falco_transaction
+    fi
+
+    systemctl stop falco-modern-bpf.service
+    if systemctl is-active --quiet falco-modern-bpf.service 2>/dev/null; then
+        echo "[CRITICAL] Falco could not be quiesced for installer-managed systemd writes."
+        return 1
+    fi
+
+    FALCO_INSTALLER_QUIESCED="true"
+    echo "[PASS] Falco sensor quiesced for installer-managed systemd writes."
+}
+
+activate_falco_after_installer_writes() {
+    if [[ "${INSTALL_FALCO}" != "true" ]]; then
+        return 0
+    fi
+    if ! falco_package_is_installed; then
+        echo "[CRITICAL] Falco package disappeared before post-install activation."
+        return 1
+    fi
+
+    systemctl restart falco-modern-bpf.service
+    validate_falco_runtime_state
+    FALCO_INSTALLER_QUIESCED="false"
+    echo "[PASS] Falco ${FALCO_PACKAGE_VERSION} modern-eBPF deployment is active and pinned."
+}
+
+validate_falco_runtime_state() {
+    local actual_version
+
+    falco_package_is_installed || {
+        echo "[CRITICAL] Falco package is not installed."
+        return 1
+    }
+    actual_version="$(falco_package_version)"
+    if [[ "${actual_version}" != "${FALCO_PACKAGE_VERSION}" ]]; then
+        echo "[CRITICAL] Falco package drift detected: ${actual_version}."
+        return 1
+    fi
+    falco_package_is_held || {
+        echo "[CRITICAL] Falco package is not apt-held under the pinned policy."
+        return 1
+    }
+    case "$(read_unit_enablement falco-modern-bpf.service)" in
+        enabled|enabled-runtime|linked|linked-runtime) ;;
+        *)
+            echo "[CRITICAL] Falco modern-eBPF service is not enabled."
+            return 1
+            ;;
+    esac
+    case "$(read_unit_enablement falcoctl-artifact-follow.service)" in
+        masked|masked-runtime) ;;
+        *)
+            echo "[CRITICAL] Falco automatic artifact updater is not masked."
+            return 1
+            ;;
+    esac
+    require_active_unit falco-modern-bpf.service || return 1
+    require_active_unit falco.service || return 1
+    if systemctl is-active --quiet falcoctl-artifact-follow.service 2>/dev/null; then
+        echo "[CRITICAL] Falco automatic artifact updater is active despite pinned policy."
+        return 1
+    fi
+    require_safe_regular_file "${FALCO_CONFIG_PATH}" "Falco Herodium configuration" || return 1
+    require_safe_regular_file "${FALCO_RULES_PATH}" "Falco Herodium rules" || return 1
+    require_safe_regular_file "${FALCO_LOGROTATE_PATH}" "Falco Herodium logrotate configuration" || return 1
+    require_safe_regular_file \
+        /var/log/herodium/falco-events.jsonl \
+        "Falco Herodium event log" || return 1
+}
+
+install_pinned_falco() {
+    local actual_version
+
+    begin_falco_transaction
+    SUPPLY_CHAIN_LOCK="${APP_DIR}/supply-chain/installer/supply-chain-lock.json"
+    load_supply_chain_lock
+
+    if [[ "${FALCO_MARKER_EXISTED}" == "true" \
+        && "${FALCO_PACKAGE_MANAGED}" == "true" \
+        && "${FALCO_PACKAGE_WAS_INSTALLED}" != "true" ]]; then
+        echo "[CRITICAL] Falco ownership marker claims a Herodium-managed package, but Falco is missing."
+        return 1
+    fi
+
+    if [[ "${FALCO_PACKAGE_WAS_INSTALLED}" == "true" ]]; then
+        actual_version="$(falco_package_version)"
+        if [[ "${actual_version}" != "${FALCO_PACKAGE_VERSION}" ]]; then
+            echo "[CRITICAL] Installed Falco version ${actual_version} does not match pinned version ${FALCO_PACKAGE_VERSION}."
+            return 1
+        fi
+        if [[ "${FALCO_MARKER_EXISTED}" != "true" ]]; then
+            validate_preexisting_falco_compatibility
+            FALCO_PACKAGE_MANAGED="false"
+            FALCO_REPOSITORY_MANAGED="false"
+        elif [[ "${FALCO_REPOSITORY_MANAGED}" == "true" ]]; then
+            install_verified_falco_repository
+        fi
+    else
+        if [[ "${FALCO_MARKER_EXISTED}" == "true" ]]; then
+            echo "[CRITICAL] Existing Falco ownership marker cannot be reconciled with a missing package."
+            return 1
+        fi
+
+        install_verified_falco_repository
+        FALCO_PACKAGE_CHANGED="true"
+        DEBIAN_FRONTEND=noninteractive \
+        FALCO_FRONTEND=noninteractive \
+        FALCO_DRIVER_CHOICE="${FALCO_DRIVER}" \
+        FALCOCTL_ENABLED=no \
+            apt-get install -y --no-install-recommends \
+                "falco=${FALCO_PACKAGE_VERSION}"
+        if [[ "$(falco_package_version)" != "${FALCO_PACKAGE_VERSION}" ]]; then
+            echo "[CRITICAL] Installed Falco package does not match the pinned version."
+            return 1
+        fi
+        FALCO_PACKAGE_MANAGED="true"
+        FALCO_REPOSITORY_MANAGED="true"
+    fi
+
+    quiesce_falco_for_installer_writes
+    install_falco_managed_assets
+
+    if [[ "${FALCO_PACKAGE_MANAGED}" == "true" ]]; then
+        apt-mark hold falco >/dev/null
+        systemctl stop falcoctl-artifact-follow.service >/dev/null 2>&1 || true
+        systemctl mask falcoctl-artifact-follow.service >/dev/null
+        systemctl unmask falco-modern-bpf.service >/dev/null 2>&1 || true
+        systemctl enable falco-modern-bpf.service >/dev/null
+    fi
+
+    FALCO_MARKER_NEEDED="true"
+    echo "[PASS] Falco deployment prepared; sensor remains quiesced until installer-managed systemd writes complete."
+}
+
+deactivate_falco_if_disabled() {
+    if [[ ! -e "${FALCO_MARKER_PATH}" && ! -L "${FALCO_MARKER_PATH}" ]]; then
+        echo "[PASS] Falco integration remains disabled; no Herodium-managed Falco state exists."
+        return 0
+    fi
+
+    begin_falco_transaction
+
+    FALCO_CONFIG_CHANGED="true"
+    FALCO_RULES_CHANGED="true"
+    FALCO_LOGROTATE_CHANGED="true"
+    rm -f -- \
+        "${FALCO_CONFIG_PATH}" \
+        "${FALCO_RULES_PATH}" \
+        "${FALCO_LOGROTATE_PATH}"
+
+    if [[ "${FALCO_PACKAGE_MANAGED}" == "true" ]] && falco_package_is_installed; then
+        systemctl stop falco-modern-bpf.service >/dev/null 2>&1 || true
+        systemctl disable falco-modern-bpf.service >/dev/null 2>&1 || true
+        apt-mark unhold falco >/dev/null 2>&1 || true
+        systemctl unmask falcoctl-artifact-follow.service >/dev/null 2>&1 || true
+    elif falco_package_is_installed \
+        && systemctl is-active --quiet falco-modern-bpf.service 2>/dev/null; then
+        systemctl restart falco-modern-bpf.service
+    fi
+
+    if [[ "${FALCO_REPOSITORY_MANAGED}" == "true" ]]; then
+        FALCO_SOURCE_CHANGED="true"
+        FALCO_KEYRING_CHANGED="true"
+        rm -f -- "${FALCO_SOURCE_LIST}" "${FALCO_KEYRING}"
+    fi
+
+    FALCO_MARKER_NEEDED="true"
+    echo "[PASS] Herodium Falco integration disabled without purging the Falco package."
 }
 
 
@@ -2174,10 +3089,21 @@ ask_maltrail_prefs() {
     fi
 }
 
-# --- 5. Fail2Ban anti-brute-force attacks ---
+
+# --- 5. Runtime behavior monitoring (Falco) ---
+ask_falco_prefs() {
+    INSTALL_FALCO="false"
+    if whiptail --title "Step 5: Runtime Behavior Monitoring" --yesno \
+        "Install/enable Falco real-time behavior monitoring?\n\nHerodium uses Falco in ALERT-ONLY mode with the modern eBPF driver.\nNo Falco event will directly kill, quarantine, or block anything." \
+        15 74; then
+        INSTALL_FALCO="true"
+    fi
+}
+
+# --- 6. Fail2Ban anti-brute-force attacks ---
 ask_fail2ban_prefs() {
     INSTALL_FAIL2BAN="false"
-    if (whiptail --title "Step 5: Anti-brute-force Protection" --yesno "Install Fail2Ban with Anti-brute-force configuration?\n\nThis will configure SSH protection with aggressive ban policies to mitigate brute-force attacks.\n\nRecommended: YES" 15 70); then
+    if (whiptail --title "Step 6: Anti-brute-force Protection" --yesno "Install Fail2Ban with Anti-brute-force configuration?\n\nThis will configure SSH protection with aggressive ban policies to mitigate brute-force attacks.\n\nRecommended: YES" 15 70); then
         INSTALL_FAIL2BAN="true"
     fi
 }
@@ -2185,7 +3111,7 @@ ask_fail2ban_prefs() {
 # --- 6. AppArmor & Hardening ---
 ask_system_hardening() {
     # 6.1 AppArmor
-    APPARMOR_LEVEL=$(whiptail --title "Step 6: AppArmor Level" --menu "Select AppArmor Strictness:" 15 70 4 \
+    APPARMOR_LEVEL=$(whiptail --title "Step 7: AppArmor Level" --menu "Select AppArmor Strictness:" 15 70 4 \
         "1" "Default (OS Default)" \
         "2" "Light/Test (Complain Mode - may reduce existing enforcement)" \
         "3" "Medium (Enforce - Blocks known threats)" \
@@ -2201,13 +3127,13 @@ ask_system_hardening() {
 
     # 6.2 Hardening (Sysctl)
     ENABLE_HARDENING="false"
-    if (whiptail --title "Step 7: Kernel Hardening" --yesno "WARNING: Apply Kernel Network Hardening?\n\nPrevents IP Spoofing and Redirects.\n\nNOT RECOMMENDED for beginners or complex network setups (Bridges/VPNs).\n\nApply?" 15 70); then
+    if (whiptail --title "Step 8: Kernel Hardening" --yesno "WARNING: Apply Kernel Network Hardening?\n\nPrevents IP Spoofing and Redirects.\n\nNOT RECOMMENDED for beginners or complex network setups (Bridges/VPNs).\n\nApply?" 15 70); then
         ENABLE_HARDENING="true"
     fi
 
     # 6.3 Rkhunter
     INSTALL_RKHUNTER="false"
-    if (whiptail --title "Step 8: Rootkit Hunter" --yesno "Install Rkhunter (Rootkit Scanner)?" 10 60); then
+    if (whiptail --title "Step 9: Rootkit Hunter" --yesno "Install Rkhunter (Rootkit Scanner)?" 10 60); then
         INSTALL_RKHUNTER="true"
         RK_FREQ=$(whiptail --menu "Rkhunter Scan Frequency:" 15 60 2 "daily" "Daily" "weekly" "Weekly" 3>&1 1>&2 2>&3) || RK_FREQ="weekly"
     fi
@@ -2361,6 +3287,7 @@ setup_timeshift
 setup_zram
 ask_clamav_prefs
 ask_maltrail_prefs
+ask_falco_prefs
 ask_fail2ban_prefs
 ask_system_hardening
 
@@ -2403,6 +3330,15 @@ INSTALL_PHASE="quiescing"
 if systemctl is-active --quiet herodium.service; then
     HERODIUM_WAS_ACTIVE="true"
     systemctl stop herodium.service
+fi
+
+# During upgrades, stop an already Herodium-managed Falco sensor immediately
+# after the consumer is quiesced. This prevents installer-owned systemd writes
+# from accumulating behind the preserved cursor and replaying as alerts.
+if [[ "${INSTALL_FALCO}" == "true" \
+    && ( -e "${FALCO_MARKER_PATH}" || -L "${FALCO_MARKER_PATH}" ) ]]; then
+    begin_falco_transaction
+    quiesce_falco_for_installer_writes
 fi
 INSTALL_PHASE="quiesced"
 
@@ -2456,7 +3392,15 @@ cat >/etc/logrotate.d/herodium <<'EOF'
 }
 EOF
 
-# 9. Install Maltrail from the immutable supply-chain lock.
+# 9. Configure Falco runtime behavior monitoring transactionally.
+if [[ "${INSTALL_FALCO}" == "true" ]]; then
+    echo "[INFO] Installing pinned Falco deployment..."
+    install_pinned_falco
+else
+    deactivate_falco_if_disabled
+fi
+
+# 10. Install Maltrail from the immutable supply-chain lock.
 if [[ "${INSTALL_MALTRAIL}" == "true" ]]; then
     echo "[INFO] Installing pinned Maltrail deployment..."
     install_pinned_maltrail
@@ -2464,7 +3408,7 @@ else
     deactivate_maltrail_if_disabled
 fi
 
-# 10. Final Systemd Setup
+# 11. Final Systemd Setup
 echo "[INFO] Installing Herodium Service..."
 HERODIUM_UNIT_CHANGED="true"
 HERODIUM_CLI_CHANGED="true"
@@ -2484,12 +3428,8 @@ install -o root -g root -m 0755 \
 systemctl daemon-reload
 systemctl unmask herodium.service >/dev/null 2>&1 || true
 systemctl enable herodium.service
-HERODIUM_LOG_VERIFY_OFFSET="$(stat -c '%s' /var/log/herodium/herodium.log)"
-systemctl restart herodium.service
-INSTALL_PHASE="service_restarted"
-validate_activated_herodium_service
 
-# 11. Configure ClamAV Scheduled Scans (POLICY-AWARE)
+# 12. Configure ClamAV Scheduled Scans (POLICY-AWARE)
 SCAN_TARGET="/"
 if [[ "$CLAM_SCAN_TYPE" == "HOME" ]]; then
     SCAN_TARGET="/home"
@@ -2625,6 +3565,20 @@ systemctl daemon-reload
 systemctl unmask herodium-scheduled-scan.timer >/dev/null 2>&1 || true
 systemctl enable --now herodium-scheduled-scan.timer
 
+# Resume Falco only after all installer-managed systemd writes are complete.
+# On upgrades this preserves the existing cursor without replaying maintenance
+# activity as security alerts.
+activate_falco_after_installer_writes
+
+# Start Herodium only after installer-managed systemd assets are fully written.
+# Fresh installs discard stale cursors left by earlier failed attempts so the
+# reader honors its start-at-EOF contract instead of replaying installer writes.
+prepare_falco_cursor_for_fresh_install
+HERODIUM_LOG_VERIFY_OFFSET="$(stat -c '%s' /var/log/herodium/herodium.log)"
+systemctl restart herodium.service
+INSTALL_PHASE="service_restarted"
+validate_activated_herodium_service
+
 INSTALL_PHASE="finalizing"
 validate_final_installer_state
 trigger_installer_test_failpoint after_final_validation
@@ -2649,9 +3603,14 @@ if [[ "${INSTALL_MALTRAIL}" == "true" ]]; then
   fi
 fi
 
+FALCO_SUMMARY="Disabled"
+if [[ "${INSTALL_FALCO}" == "true" ]]; then
+  FALCO_SUMMARY="Installed/enabled (modern eBPF, alert-only, pinned ${FALCO_PACKAGE_VERSION})"
+fi
+
 RKHUNTER_SUMMARY="Not installed"
 if [[ "${INSTALL_RKHUNTER}" == "true" ]]; then
   RKHUNTER_SUMMARY="Installed (${RK_FREQ}; baseline updates are operator-controlled)"
 fi
 
-whiptail --msgbox "Installation Complete!\n\n- Snapshot: ${SNAPSHOT_STATUS}\n- ZRAM: ${ZRAM_STATUS}\n- ClamAV: ${CLAMAV_SUMMARY}\n- Maltrail: ${MALTRAIL_SUMMARY}\n- Rkhunter: ${RKHUNTER_SUMMARY}\n- Fail2Ban: ${INSTALL_FAIL2BAN}\n- AppArmor: Level ${APPARMOR_LEVEL}\n\nRun 'sudo herodium-top' to monitor." 18 78
+whiptail --msgbox "Installation Complete!\n\n- Snapshot: ${SNAPSHOT_STATUS}\n- ZRAM: ${ZRAM_STATUS}\n- ClamAV: ${CLAMAV_SUMMARY}\n- Maltrail: ${MALTRAIL_SUMMARY}\n- Falco: ${FALCO_SUMMARY}\n- Rkhunter: ${RKHUNTER_SUMMARY}\n- Fail2Ban: ${INSTALL_FAIL2BAN}\n- AppArmor: Level ${APPARMOR_LEVEL}\n\nRun 'sudo herodium-top' to monitor." 18 78
