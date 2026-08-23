@@ -11,6 +11,17 @@ APP_DIR="/opt/herodium"
 MALTRAIL_DIR="/opt/maltrail"
 LOG_DIR="/var/log/herodium"
 MALTRAIL_LOG_DIR="/var/log/maltrail"
+FALCO_STATE_DIR="/var/lib/herodium/falco"
+FALCO_MARKER_PATH="${FALCO_STATE_DIR}/ownership.json"
+FALCO_SOURCE_LIST="/etc/apt/sources.list.d/herodium-falco.list"
+FALCO_KEYRING="/usr/share/keyrings/herodium-falco-archive-keyring.gpg"
+FALCO_CONFIG_PATH="/etc/falco/config.d/herodium.yaml"
+FALCO_RULES_PATH="/etc/falco/rules.d/herodium-rules.yaml"
+FALCO_LOGROTATE_PATH="/etc/logrotate.d/herodium-falco"
+FALCO_MARKER_VALID="false"
+FALCO_PACKAGE_MANAGED="false"
+FALCO_REPOSITORY_MANAGED="false"
+FALCO_WAS_ACTIVE="false"
 
 # --- Check Root ---
 if [[ $EUID -ne 0 ]]; then
@@ -22,6 +33,136 @@ fi
 if ! command -v whiptail &> /dev/null; then
     apt-get update -y && apt-get install -y whiptail
 fi
+
+
+
+falco_uninstall_package_is_installed() {
+    dpkg-query -W -f='${db:Status-Status}\n' falco 2>/dev/null \
+        | grep -Fx 'installed' >/dev/null
+}
+
+load_falco_uninstall_ownership() {
+    local mode
+    local parsed
+
+    if [[ ! -e "${FALCO_MARKER_PATH}" ]]; then
+        return 0
+    fi
+    if [[ -L "${FALCO_MARKER_PATH}" || ! -f "${FALCO_MARKER_PATH}" ]]; then
+        echo "WARNING: Falco ownership marker is unsafe; Falco package/repository will be preserved."
+        return 0
+    fi
+    if [[ "$(stat -c '%u' -- "${FALCO_MARKER_PATH}")" != "0" ]]; then
+        echo "WARNING: Falco ownership marker is not root-owned; Falco package/repository will be preserved."
+        return 0
+    fi
+    mode="$(stat -c '%a' -- "${FALCO_MARKER_PATH}")"
+    if (( (8#${mode}) & 0077 )); then
+        echo "WARNING: Falco ownership marker is not private; Falco package/repository will be preserved."
+        return 0
+    fi
+
+    parsed="$(python3 - "${FALCO_MARKER_PATH}" <<'PYFALCOUNINSTALL'
+import json
+import sys
+from pathlib import Path
+
+try:
+    data = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+    raise SystemExit(f"invalid marker: {exc}")
+if set(data) != {
+    "schema_version",
+    "package_installed_by_herodium",
+    "repository_installed_by_herodium",
+} or data["schema_version"] != 1:
+    raise SystemExit("unexpected marker schema")
+for key in (
+    "package_installed_by_herodium",
+    "repository_installed_by_herodium",
+):
+    if not isinstance(data[key], bool):
+        raise SystemExit(f"non-boolean marker field: {key}")
+if data["package_installed_by_herodium"] != data["repository_installed_by_herodium"]:
+    raise SystemExit("inconsistent Falco ownership marker")
+print(
+    "\t".join(
+        (
+            "true" if data["package_installed_by_herodium"] else "false",
+            "true" if data["repository_installed_by_herodium"] else "false",
+        )
+    )
+)
+PYFALCOUNINSTALL
+)" || {
+        echo "WARNING: Falco ownership marker is invalid; Falco package/repository will be preserved."
+        return 0
+    }
+
+    IFS=$'\t' read -r \
+        FALCO_PACKAGE_MANAGED \
+        FALCO_REPOSITORY_MANAGED \
+        <<< "${parsed}"
+    FALCO_MARKER_VALID="true"
+}
+
+cleanup_herodium_falco_integration() {
+    local remove_package="false"
+
+    if [[ "${FALCO_MARKER_VALID}" != "true" ]]; then
+        echo " -> No validated Herodium Falco ownership marker; preserving all Falco state."
+        return 0
+    fi
+
+    if systemctl is-active --quiet falco.service 2>/dev/null; then
+        FALCO_WAS_ACTIVE="true"
+    fi
+
+    rm -f -- \
+        "${FALCO_CONFIG_PATH}" \
+        "${FALCO_RULES_PATH}" \
+        "${FALCO_LOGROTATE_PATH}"
+
+    if [[ "${FALCO_MARKER_VALID}" == "true" \
+        && "${FALCO_PACKAGE_MANAGED}" == "true" ]] \
+        && falco_uninstall_package_is_installed; then
+        if whiptail --title "Remove Falco?" --yesno \
+            "Falco was originally installed by Herodium.\n\nRemove the Falco package too?\n\nChoose NO if you now use Falco independently." \
+            13 70; then
+            remove_package="true"
+        fi
+
+        apt-mark unhold falco >/dev/null 2>&1 || true
+        systemctl unmask falcoctl-artifact-follow.service >/dev/null 2>&1 || true
+        if [[ "${remove_package}" == "true" ]]; then
+            systemctl stop falco-modern-bpf.service >/dev/null 2>&1 || true
+            systemctl disable falco-modern-bpf.service >/dev/null 2>&1 || true
+            DEBIAN_FRONTEND=noninteractive apt-get purge -y falco
+            echo " -> Herodium-installed Falco package removed."
+        elif [[ "${FALCO_WAS_ACTIVE}" == "true" ]]; then
+            systemctl restart falco-modern-bpf.service || true
+            echo " -> Falco package kept; Herodium-specific configuration removed."
+        else
+            echo " -> Falco package kept; Herodium-specific configuration removed."
+        fi
+    elif [[ "${FALCO_WAS_ACTIVE}" == "true" ]]; then
+        systemctl restart falco.service || true
+        echo " -> Pre-existing Falco kept; Herodium-specific configuration removed."
+    fi
+
+    if [[ "${FALCO_MARKER_VALID}" == "true" \
+        && "${FALCO_REPOSITORY_MANAGED}" == "true" ]]; then
+        rm -f -- "${FALCO_SOURCE_LIST}" "${FALCO_KEYRING}"
+        apt-get update -y || true
+    fi
+
+    if [[ "${FALCO_MARKER_VALID}" == "true" ]]; then
+        rm -f -- "${FALCO_MARKER_PATH}" "${FALCO_STATE_DIR}/cursor.json"
+        if [[ -d "${FALCO_STATE_DIR}" && ! -L "${FALCO_STATE_DIR}" ]]; then
+            rmdir "${FALCO_STATE_DIR}" 2>/dev/null || true
+        fi
+    fi
+}
 
 # ==============================================================================
 # CONFIRMATION
@@ -36,6 +177,8 @@ echo ""
 echo "=========================================="
 echo "Starting Uninstallation..."
 echo "=========================================="
+
+load_falco_uninstall_ownership
 
 # 1. Stop and Disable Services
 echo "[1/6] Stopping services..."
@@ -127,6 +270,8 @@ if [[ -f "${APPARMOR_STATE_TOOL}" ]]; then
 else
     echo "WARNING: AppArmor state tool is unavailable; persistent state was left unchanged."
 fi
+
+cleanup_herodium_falco_integration
 
 rm -rf "${APP_DIR}"
 rm -rf "${LOG_DIR}"
