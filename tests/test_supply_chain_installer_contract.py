@@ -2,7 +2,6 @@ import json
 import unittest
 from pathlib import Path
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 INSTALLER = PROJECT_ROOT / "installer/install.sh"
 LOCK = PROJECT_ROOT / "installer/supply-chain-lock.json"
@@ -14,7 +13,7 @@ class SupplyChainInstallerContractTests(unittest.TestCase):
     def test_maltrail_lock_is_exact_and_immutable(self):
         lock = json.loads(LOCK.read_text(encoding="utf-8"))
 
-        self.assertEqual(lock["schema_version"], 1)
+        self.assertEqual(lock["schema_version"], 2)
         self.assertEqual(
             lock["maltrail"],
             {
