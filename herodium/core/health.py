@@ -1,7 +1,7 @@
+from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Iterable, Tuple
 
 
 class SystemHealth(Enum):
@@ -27,7 +27,7 @@ class ComponentHealth:
 
 @dataclass(frozen=True)
 class HealthReport:
-    components: Tuple[ComponentHealth, ...]
+    components: tuple[ComponentHealth, ...]
 
     @classmethod
     def from_components(cls, components: Iterable[ComponentHealth]):
@@ -71,6 +71,22 @@ class HealthReport:
                 return component
         raise KeyError(name)
 
+    def with_component(self, replacement):
+        if not isinstance(replacement, ComponentHealth):
+            raise TypeError("replacement must be a ComponentHealth instance.")
+
+        updated = []
+        replaced = False
+        for component in self.components:
+            if component.name == replacement.name:
+                updated.append(replacement)
+                replaced = True
+            else:
+                updated.append(component)
+        if not replaced:
+            updated.append(replacement)
+        return HealthReport.from_components(updated)
+
 
 class StartupHealthManager:
     """Collect and publish deterministic startup health for Herodium."""
@@ -90,6 +106,7 @@ class StartupHealthManager:
         performance_manager,
         filesystem_monitor,
         start_memory_hunter,
+        falco_monitor=None,
     ):
         self.config = config
         self.logger = logger
@@ -103,6 +120,7 @@ class StartupHealthManager:
         self.performance_manager = performance_manager
         self.filesystem_monitor = filesystem_monitor
         self.start_memory_hunter = start_memory_hunter
+        self.falco_monitor = falco_monitor
 
     @staticmethod
     def _safe_bool(value, default=False):
@@ -119,13 +137,16 @@ class StartupHealthManager:
         return default
 
     def _config_bool(self, section, key, default=False):
-        section_config = self.config.get(section, {}) or {}
+        section_config = self.config.get(section, {})
+        if not isinstance(section_config, dict):
+            return default
         return self._safe_bool(section_config.get(key), default)
 
     def _run_operation(self, label, operation):
         try:
             result = operation()
-        except Exception as exc:
+        # Startup callbacks span heterogeneous components; isolate failures here.
+        except Exception as exc:  # noqa: BLE001
             self.logger.error(f"{label} startup failed: {exc}")
             return False
         return result is not False
@@ -155,7 +176,13 @@ class StartupHealthManager:
                 return False
         return True
 
-    def collect(self, *, live_monitor_enabled, maltrail_enabled):
+    def collect(
+        self,
+        *,
+        live_monitor_enabled,
+        maltrail_enabled,
+        falco_enabled=False,
+    ):
         components = []
 
         clamav_healthy = self.scanner.health_check()
@@ -182,6 +209,7 @@ class StartupHealthManager:
         self._collect_hardening(components)
         self._collect_scheduler(components)
         self._collect_maltrail(components, maltrail_enabled)
+        self._collect_falco(components, falco_enabled)
         self._collect_performance_manager(components)
         self._collect_live_monitor(components, live_monitor_enabled)
         return HealthReport.from_components(components)
@@ -343,6 +371,122 @@ class StartupHealthManager:
                 ),
             )
         )
+
+    def _collect_falco(self, components, enabled):
+        if not enabled:
+            components.append(self.falco_runtime_component(False))
+            return
+
+        if self.falco_monitor is None:
+            components.append(self.falco_runtime_component(True))
+            return
+
+        started = self._run_operation("Falco Monitor", self.falco_monitor.start)
+        components.append(
+            ComponentHealth(
+                "falco",
+                ComponentState.HEALTHY
+                if started
+                else ComponentState.DEGRADED,
+                detail=(
+                    "Falco monitor thread started"
+                    if started
+                    else "Falco monitor thread failed to start"
+                ),
+            )
+        )
+
+    def falco_runtime_component(self, enabled):
+        if not enabled:
+            return ComponentHealth(
+                "falco",
+                ComponentState.DISABLED_BY_POLICY,
+                detail="disabled in configuration",
+            )
+
+        if self.falco_monitor is None:
+            return ComponentHealth(
+                "falco",
+                ComponentState.DEGRADED,
+                detail="Falco monitor configuration could not be initialized",
+            )
+
+        try:
+            snapshot = self.falco_monitor.health()
+        # Runtime status collection is an optional-component isolation boundary.
+        except Exception as exc:  # noqa: BLE001
+            self.logger.error(
+                "Falco runtime health collection failed: %s",
+                type(exc).__name__,
+            )
+            return ComponentHealth(
+                "falco",
+                ComponentState.DEGRADED,
+                detail="Falco runtime health could not be collected",
+            )
+
+        state_name = getattr(snapshot.state, "value", str(snapshot.state))
+        healthy = state_name in {"STARTING", "HEALTHY"}
+        stats = snapshot.stats
+        detail = (
+            f"runtime={state_name}; "
+            f"thread_alive={str(snapshot.thread_alive).lower()}; "
+            f"queue={snapshot.queue_size}/{snapshot.queue_capacity}; "
+            f"dropped={stats.events_dropped}; "
+            f"rejected={stats.events_rejected}; "
+            f"reader_errors={stats.reader_errors}"
+        )
+        return ComponentHealth(
+            "falco",
+            ComponentState.HEALTHY if healthy else ComponentState.DEGRADED,
+            detail=detail,
+        )
+
+    def emit_component_transition(
+        self,
+        previous,
+        current,
+        report,
+        notifier,
+    ):
+        if previous.state is current.state:
+            return False
+
+        message = (
+            "Runtime health transition: "
+            f"name={current.name}, "
+            f"from={previous.state.value}, "
+            f"to={current.state.value}, "
+            f"detail={current.detail}"
+        )
+        if current.state in (ComponentState.DEGRADED, ComponentState.FAILED):
+            self.logger.warning(message)
+            notification_message = (
+                f"{current.name} runtime monitoring is {current.state.value}."
+            )
+            notification_level = "critical"
+        else:
+            self.logger.info(message)
+            notification_message = (
+                f"{current.name} runtime monitoring recovered."
+            )
+            notification_level = "normal"
+
+        try:
+            notifier.send_notification(
+                "Herodium Security",
+                notification_message,
+                level=notification_level,
+            )
+        # Runtime notifications are optional and must not break protection loops.
+        except Exception as exc:  # noqa: BLE001
+            self.logger.error(
+                "Runtime health notification failed: %s",
+                type(exc).__name__,
+            )
+
+        self.logger.info("Runtime system health is %s.", report.state.value)
+        return True
 
     def _collect_performance_manager(self, components):
         started = self._run_operation(
