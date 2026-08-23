@@ -1,8 +1,17 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "maltrail": {
     "repository": "https://github.com/stamparm/maltrail.git",
     "commit": "32bb71160d0c4305386838a29df67923c2919196",
     "license_sha256": "36d6d9af4331b4153c4d8dc5e3d92836794bd3bfb44744ed24fb4673413d9a0a"
+  },
+  "falco": {
+    "repository": "https://download.falco.org/packages/deb",
+    "suite": "stable",
+    "component": "main",
+    "key_url": "https://falco.org/repo/falcosecurity-packages.asc",
+    "trusted_fingerprint": "478B2FBBC75F4237B731DA4365106822B35B1B1F",
+    "package_version": "0.44.1",
+    "driver": "modern_ebpf"
   }
 }
