@@ -7,7 +7,6 @@ import tempfile
 import unittest
 from pathlib import Path
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 INSTALLER = PROJECT_ROOT / "installer/install.sh"
 README = PROJECT_ROOT / "README.md"
@@ -154,8 +153,19 @@ class StagedDeploymentInstallerContractTests(unittest.TestCase):
             sys.argv = original_argv
 
         fields = output.getvalue().strip().split("\t")
-        self.assertEqual(len(fields), 3)
+        self.assertEqual(len(fields), 10)
         self.assertEqual(fields[0], "https://github.com/stamparm/maltrail.git")
+        self.assertRegex(fields[1], r"^[0-9a-f]{40}$")
+        self.assertRegex(fields[2], r"^[0-9a-f]{64}$")
+        self.assertEqual(fields[3], "https://download.falco.org/packages/deb")
+        self.assertEqual(fields[4:6], ["stable", "main"])
+        self.assertEqual(
+            fields[6], "https://falco.org/repo/falcosecurity-packages.asc"
+        )
+        self.assertEqual(
+            fields[7], "478B2FBBC75F4237B731DA4365106822B35B1B1F"
+        )
+        self.assertEqual(fields[8:], ["0.44.1", "modern_ebpf"])
 
     def test_pip_is_isolated_hashed_and_dependency_closed(self):
         content = INSTALLER.read_text(encoding="utf-8")
@@ -393,6 +403,9 @@ class StagedDeploymentInstallerContractTests(unittest.TestCase):
             "bin/herodium-scan",
             "bin/herodium-top",
             "bin/herodium-rkhunter-baseline",
+            "falco/herodium-falco.yaml",
+            "falco/herodium-falco-rules.yaml",
+            "logrotate/herodium-falco",
             "supply-chain-lock.json",
         ):
             self.assertIn(
