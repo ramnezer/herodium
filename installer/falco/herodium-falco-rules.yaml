@@ -1,0 +1,16 @@
+# Herodium-specific Falco rules.
+# Keep these rules alert-only and high-signal. Herodium performs notification
+# and correlation; Falco is configured to run ERROR and more severe rules only.
+
+- rule: Herodium Write To Systemd Unit Directory
+  desc: Detect writes below the system-wide systemd unit directory.
+  condition: >
+    (evt.type in (open, openat, openat2) and evt.is_open_write=true and
+    fd.typechar='f' and fd.num>=0) and
+    fd.name startswith /etc/systemd/system
+  output: >
+    Herodium systemd unit write
+    (file=%fd.name process=%proc.name proc_exepath=%proc.exepath
+    parent=%proc.pname user=%user.name user_uid=%user.uid evt_type=%evt.type)
+  priority: ERROR
+  tags: [herodium, host, persistence, mitre_persistence, T1543.002]

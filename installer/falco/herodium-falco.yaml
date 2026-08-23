@@ -1,0 +1,15 @@
+# Herodium-managed Falco alert output.
+# This file is installed as a local override under /etc/falco/config.d/.
+json_output: true
+json_include_output_property: true
+json_include_output_fields_property: true
+json_include_tags_property: true
+time_format_iso_8601: true
+
+# High-signal policy: run only ERROR and more severe rules.
+priority: error
+
+file_output:
+  enabled: true
+  keep_alive: false
+  filename: /var/log/herodium/falco-events.jsonl
