@@ -80,6 +80,27 @@ memory_scan:
     - "gnome-shell"
     - "systemd"
 
+falco:
+  # Optional real-time behavioral monitoring. Herodium only consumes alerts.
+  enable: false
+  mode: "alert_only"
+  event_log_path: "/var/log/herodium/falco-events.jsonl"
+  cursor_path: "/var/lib/herodium/falco/cursor.json"
+  start_position: "end"
+  queue_max_size: 2048
+  poll_interval_seconds: 0.25
+  warning_interval_seconds: 30
+  warning_cache_max_entries: 64
+
+  # Herodium drains Falco alerts in bounded batches and rate-limits repeats.
+  dispatch:
+    max_events_per_cycle: 256
+    alert_cooldown_seconds: 60
+    alert_cache_max_entries: 1024
+    minimum_priority: "ERROR"
+    notification_minimum_priority: "ERROR"
+    desktop_notifications: true
+
 maltrail:
   enable: false
   log_path: "/var/log/maltrail/detected.log"
