@@ -1,0 +1,16 @@
+/var/log/herodium/falco-events.jsonl {
+    daily
+    rotate 7
+    maxsize 25M
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0600 root root
+    sharedscripts
+    postrotate
+        if systemctl is-active --quiet falco.service; then
+            systemctl kill --kill-who=main --signal=SIGUSR1 falco.service >/dev/null 2>&1 || true
+        fi
+    endscript
+}
