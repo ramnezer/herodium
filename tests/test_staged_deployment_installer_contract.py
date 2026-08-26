@@ -317,6 +317,20 @@ class StagedDeploymentInstallerContractTests(unittest.TestCase):
         self.assertNotIn('python3 -m venv "${APP_DIR}/venv"', content)
         self.assertNotIn('"${APP_DIR}/venv/bin/pip"', content)
 
+    def test_legacy_memory_whitelist_is_migrated_during_staging(self):
+        content = INSTALLER.read_text(encoding="utf-8")
+
+        self.assertIn('HERODIUM_STAGE_ROOT="${APP_STAGE_DIR}"', content)
+        self.assertIn(
+            "from core.config_migrations import migrate_memory_hunter_whitelist",
+            content,
+        )
+        self.assertIn("if migrate_memory_hunter_whitelist(config):", content)
+        self.assertIn(
+            "Migrated legacy Memory Hunter whitelist to hardened",
+            content,
+        )
+
     def test_config_and_quarantine_are_preserved_safely(self):
         content = INSTALLER.read_text(encoding="utf-8")
 
