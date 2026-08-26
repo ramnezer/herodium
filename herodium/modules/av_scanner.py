@@ -5,7 +5,6 @@ import threading
 import time
 from dataclasses import dataclass
 from enum import Enum
-from typing import Optional
 
 import pyclamd
 
@@ -35,9 +34,9 @@ class ScanReason(Enum):
 class ScanResult:
     status: ScanStatus
     path: str
-    reason: Optional[ScanReason] = None
-    threat_name: Optional[str] = None
-    detail: Optional[str] = None
+    reason: ScanReason | None = None
+    threat_name: str | None = None
+    detail: str | None = None
 
     @property
     def completed(self):
@@ -51,6 +50,16 @@ class ScanResult:
         raise TypeError(
             "ScanResult has no implicit truth value; inspect result.status explicitly"
         )
+
+
+@dataclass(frozen=True)
+class _FileIdentity:
+    device: int
+    inode: int
+
+    @classmethod
+    def from_stat(cls, metadata):
+        return cls(device=metadata.st_dev, inode=metadata.st_ino)
 
 
 class ClamAVScanner:
@@ -83,7 +92,7 @@ class ClamAVScanner:
         try:
             v = int(value)
             return v if v > 0 else default
-        except Exception:
+        except (TypeError, ValueError, OverflowError):
             return default
 
     @staticmethod
@@ -111,7 +120,8 @@ class ClamAVScanner:
             self.cd = client
             self.logger.info("Connected to ClamAV Daemon.")
             return True
-        except Exception as e:
+        # External client libraries may raise non-standard exceptions; fail closed.
+        except Exception as e:  # noqa: BLE001
             self.logger.error(f"ClamAV Connection Failed: {e}")
             return False
 
@@ -121,7 +131,8 @@ class ClamAVScanner:
             if self.cd is not None:
                 try:
                     ping_response = self.cd.ping()
-                except Exception as exc:
+                # External client libraries may raise non-standard exceptions; fail closed.
+                except Exception as exc:  # noqa: BLE001
                     self.logger.error(f"ClamAV health check failed: {exc}")
                     self.cd = None
                 else:
@@ -137,65 +148,86 @@ class ClamAVScanner:
 
     def scan_file(self, file_path):
         path = os.fspath(file_path)
+        source_fd = None
 
         try:
-            size = os.path.getsize(path)
+            source_flags = os.O_RDONLY
+            source_flags |= getattr(os, "O_CLOEXEC", 0)
+            source_flags |= getattr(os, "O_NOFOLLOW", 0)
+            source_fd = os.open(path, source_flags)
+            scanned_stat = os.fstat(source_fd)
         except FileNotFoundError:
             return ScanResult(
                 ScanStatus.SKIPPED, path, ScanReason.FILE_NOT_FOUND
             )
         except OSError as e:
-            self.logger.error(f"Unable to inspect file before scanning {path}: {e}")
+            self.logger.error(f"Unable to open file safely for scanning {path}: {e}")
             return ScanResult(
-                ScanStatus.ERROR, path, ScanReason.STAT_FAILED, detail=str(e)
+                ScanStatus.ERROR, path, ScanReason.READ_FAILED, detail=str(e)
             )
 
-        if size == 0:
-            return ScanResult(ScanStatus.SKIPPED, path, ScanReason.EMPTY_FILE)
-
-        max_bytes = self.effective_max_file_size_mb * 1024 * 1024
-        if size > max_bytes:
-            return ScanResult(
-                ScanStatus.SKIPPED,
-                path,
-                ScanReason.FILE_TOO_LARGE,
-                detail=f"size={size}, limit={max_bytes}",
-            )
-
-        with self.lock:
-            if not self.cd and not self._connect():
+        try:
+            if not stat.S_ISREG(scanned_stat.st_mode):
+                self.logger.error(f"Refusing to scan non-regular file: {path}")
                 return ScanResult(
-                    ScanStatus.UNAVAILABLE, path, ScanReason.CLAMAV_UNAVAILABLE
+                    ScanStatus.ERROR,
+                    path,
+                    ScanReason.READ_FAILED,
+                    detail="not a regular file",
+                )
+
+            size = scanned_stat.st_size
+            if size == 0:
+                return ScanResult(ScanStatus.SKIPPED, path, ScanReason.EMPTY_FILE)
+
+            max_bytes = self.effective_max_file_size_mb * 1024 * 1024
+            if size > max_bytes:
+                return ScanResult(
+                    ScanStatus.SKIPPED,
+                    path,
+                    ScanReason.FILE_TOO_LARGE,
+                    detail=f"size={size}, limit={max_bytes}",
                 )
 
             try:
-                with open(path, 'rb') as f:
-                    file_content = f.read()
-            except FileNotFoundError:
-                return ScanResult(
-                    ScanStatus.SKIPPED, path, ScanReason.FILE_NOT_FOUND
-                )
+                with os.fdopen(source_fd, 'rb', closefd=False) as source:
+                    file_content = source.read()
             except OSError as e:
                 self.logger.error(f"Unable to read file for scanning {path}: {e}")
                 return ScanResult(
                     ScanStatus.ERROR, path, ScanReason.READ_FAILED, detail=str(e)
                 )
 
-            try:
-                response = self.cd.scan_stream(file_content)
-            except Exception as e:
-                self.logger.error(f"ClamAV scan failed for {path}: {e}")
-                self.cd = None
-                return ScanResult(
-                    ScanStatus.UNAVAILABLE,
-                    path,
-                    ScanReason.SCAN_FAILED,
-                    detail=str(e),
-                )
+            scanned_identity = _FileIdentity.from_stat(scanned_stat)
 
-        return self._interpret_scan_response(path, response)
+            with self.lock:
+                if not self.cd and not self._connect():
+                    return ScanResult(
+                        ScanStatus.UNAVAILABLE, path, ScanReason.CLAMAV_UNAVAILABLE
+                    )
 
-    def _interpret_scan_response(self, path, response):
+                try:
+                    response = self.cd.scan_stream(file_content)
+                # External client libraries may raise non-standard exceptions; fail closed.
+                except Exception as e:  # noqa: BLE001
+                    self.logger.error(f"ClamAV scan failed for {path}: {e}")
+                    self.cd = None
+                    return ScanResult(
+                        ScanStatus.UNAVAILABLE,
+                        path,
+                        ScanReason.SCAN_FAILED,
+                        detail=str(e),
+                    )
+        finally:
+            if source_fd is not None:
+                try:
+                    os.close(source_fd)
+                except OSError:
+                    pass
+
+        return self._interpret_scan_response(path, response, scanned_identity)
+
+    def _interpret_scan_response(self, path, response, scanned_identity):
         if response is None:
             return ScanResult(ScanStatus.CLEAN, path)
 
@@ -222,7 +254,7 @@ class ClamAVScanner:
         if verdict == 'FOUND':
             virus_name = detail or 'Unknown ClamAV signature'
             self.logger.critical(f"VIRUS DETECTED: {path} -> {virus_name}")
-            self._handle_threat(path, virus_name)
+            self._handle_threat(path, virus_name, scanned_identity)
             return ScanResult(
                 ScanStatus.INFECTED, path, threat_name=virus_name
             )
@@ -237,12 +269,12 @@ class ClamAVScanner:
             ScanStatus.ERROR, path, reason, detail=detail or repr(stream_result)
         )
 
-    def _handle_threat(self, file_path, virus_name):
+    def _handle_threat(self, file_path, virus_name, scanned_identity):
         """Executes the action chosen by the user in the installer."""
         if self.action_policy == 'delete':
-            self._delete_file(file_path, virus_name)
+            self._delete_file(file_path, virus_name, scanned_identity)
         elif self.action_policy == 'quarantine':
-            self._quarantine(file_path, virus_name)
+            self._quarantine(file_path, virus_name, scanned_identity)
         else:
             # Alert only
             self.logger.warning(f"Alert Only: Malicious file left in place: {file_path}")
@@ -252,28 +284,61 @@ class ClamAVScanner:
                 level='critical'
             )
 
-    def _delete_file(self, file_path, virus_name):
+    def _delete_file(self, file_path, virus_name, scanned_identity):
+        source_fd = None
         try:
-            if os.path.exists(file_path):
-                os.remove(file_path)
-                self.logger.info(f"DELETED infected file: {file_path}")
-                self.notifier.send_notification(
-                    "VIRUS DELETED",
-                    f"File: {os.path.basename(file_path)}\nThreat: {virus_name}"
-                )
-            else:
-                self.logger.info(f"File vanished before deletion (Already removed): {file_path}")
+            source_flags = os.O_RDONLY
+            source_flags |= getattr(os, "O_CLOEXEC", 0)
+            source_flags |= getattr(os, "O_NOFOLLOW", 0)
+            source_fd = os.open(file_path, source_flags)
+            opened_stat = os.fstat(source_fd)
 
+            if (
+                not stat.S_ISREG(opened_stat.st_mode)
+                or _FileIdentity.from_stat(opened_stat) != scanned_identity
+            ):
+                self.logger.error(
+                    "Delete refused because source identity changed after scan: "
+                    f"{file_path}"
+                )
+                return
+
+            current_stat = os.lstat(file_path)
+            if (
+                not stat.S_ISREG(current_stat.st_mode)
+                or _FileIdentity.from_stat(current_stat) != scanned_identity
+            ):
+                self.logger.error(
+                    "Delete refused because source path changed before removal: "
+                    f"{file_path}"
+                )
+                return
+
+            os.unlink(file_path)
+            self.logger.info(f"DELETED infected file: {file_path}")
+            self.notifier.send_notification(
+                "VIRUS DELETED",
+                f"File: {os.path.basename(file_path)}\nThreat: {virus_name}"
+            )
+
+        except FileNotFoundError:
+            self.logger.info(f"File vanished before deletion (Already removed): {file_path}")
         except OSError as e:
-            # If file not found (Errno 2), it's a success (already gone)
             if e.errno == 2:
                 self.logger.info(f"File vanished before deletion (Already removed): {file_path}")
             else:
                 self.logger.error(f"Failed to delete {file_path}: {e}")
-        except Exception as e:
+        # Remediation is a service boundary; unexpected failures are contained.
+        except Exception as e:  # noqa: BLE001
             self.logger.error(f"Unexpected error deleting {file_path}: {e}")
+        finally:
+            if source_fd is not None:
+                try:
+                    os.close(source_fd)
+                except OSError:
+                    pass
 
-    def _quarantine(self, file_path, virus_name):
+    def _quarantine(self, file_path, virus_name, scanned_identity=None):
         dest = None
         dest_complete = False
         source_fd = None
@@ -289,6 +354,16 @@ class ClamAVScanner:
             if not stat.S_ISREG(initial_stat.st_mode):
                 self.logger.error(
                     "Quarantine refused non-regular source path: "
+                    f"{file_path}"
+                )
+                return
+
+            initial_identity = _FileIdentity.from_stat(initial_stat)
+            if scanned_identity is None:
+                scanned_identity = initial_identity
+            elif initial_identity != scanned_identity:
+                self.logger.error(
+                    "Quarantine refused because source identity changed after scan: "
                     f"{file_path}"
                 )
                 return
@@ -316,10 +391,7 @@ class ClamAVScanner:
 
             if not stat.S_ISREG(opened_stat.st_mode):
                 raise OSError(f"quarantine source is not a regular file: {file_path}")
-            if (
-                opened_stat.st_dev != initial_stat.st_dev
-                or opened_stat.st_ino != initial_stat.st_ino
-            ):
+            if _FileIdentity.from_stat(opened_stat) != scanned_identity:
                 raise OSError(f"quarantine source changed before capture: {file_path}")
 
             file_name = os.path.basename(file_path)
@@ -383,7 +455,8 @@ class ClamAVScanner:
                 self.logger.info(f"Quarantine skipped (file vanished): {file_path}")
             else:
                 self.logger.error(f"Quarantine failed: {e}")
-        except Exception as e:
+        # Remediation is a service boundary; unexpected failures are contained.
+        except Exception as e:  # noqa: BLE001
             self.logger.error(f"Quarantine failed: {e}")
         finally:
             if source_fd is not None:
