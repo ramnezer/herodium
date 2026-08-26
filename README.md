@@ -35,7 +35,7 @@ Herodium currently focuses on these areas:
 ### Memory / Process Inspection
 - Iterates running processes and inspects:
   - the executable path
-  - file-based command-line arguments
+  - file-based command-line arguments, including relative paths resolved against the process working directory
 - Uses ClamAV-backed scanning logic to identify infected binaries or loaded files.
 - Terminates a process if an infected executable or related file is detected.
 
@@ -46,6 +46,10 @@ Herodium currently focuses on these areas:
   - `delete`
   - `alert`
 - Enforces size-based prefiltering before stream scanning.
+- Binds remediation to the filesystem identity of the exact regular file opened
+  for ClamAV stream scanning. Quarantine/delete refuse to act on a replacement
+  pathname when `(device, inode)` no longer matches the object that produced the
+  ClamAV verdict.
 
 ### Falco Runtime Behavioral Monitoring
 - Optionally integrates [Falco](https://falco.org/) as a host runtime behavior sensor.
@@ -90,7 +94,8 @@ Herodium currently focuses on these areas:
 │   │   ├── engine.py
 │   │   ├── health.py
 │   │   ├── logger.py
-│   │   └── system_command.py
+│   │   ├── system_command.py
+│   │   └── config_migrations.py
 │   ├── modules/
 │   │   ├── __init__.py
 │   │   ├── apparmor_manager.py
@@ -622,6 +627,14 @@ Important keys include:
 - `hardening.enable`
 - `ips.enable`
 - `apparmor.level`
+
+`memory_scan.whitelist` is an executable identity allowlist, not a process-name
+allowlist. Entries must be absolute paths. At startup, Memory Hunter resolves each
+existing entry and accepts it only when it is a root-owned regular executable with
+no group/world write bits. Herodium pins the executable `(device, inode)` identity
+and, before skipping a live process, requires `/proc/<pid>/exe` to refer to that
+same object. A copied or renamed binary such as `/tmp/firefox` is therefore not
+trusted merely because its basename or process name resembles a legitimate tool.
 
 After changing the YAML file:
 
