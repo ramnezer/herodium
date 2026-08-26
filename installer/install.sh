@@ -1185,6 +1185,7 @@ run_staged_pip() {
 
 update_staged_herodium_config() {
     HERODIUM_STAGE_CONFIG="${APP_STAGE_DIR}/config/herodium.yaml" \
+    HERODIUM_STAGE_ROOT="${APP_STAGE_DIR}" \
     HERODIUM_CLAM_FREQ="${CLAM_FREQ}" \
     HERODIUM_CLAM_SCAN_TYPE="${CLAM_SCAN_TYPE}" \
     HERODIUM_INSTALL_RKHUNTER="${INSTALL_RKHUNTER}" \
@@ -1202,9 +1203,14 @@ update_staged_herodium_config() {
     HERODIUM_ENABLE_ZRAM="${ENABLE_ZRAM}" \
         "${APP_STAGE_DIR}/venv/bin/python3" - <<'PYCONFIG'
 import os
+import sys
 from pathlib import Path
 
 import yaml
+
+sys.path.insert(0, os.environ["HERODIUM_STAGE_ROOT"])
+
+from core.config_migrations import migrate_memory_hunter_whitelist
 
 
 def enabled(name: str) -> bool:
@@ -1215,6 +1221,12 @@ config_path = Path(os.environ["HERODIUM_STAGE_CONFIG"])
 config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
 if not isinstance(config, dict):
     raise SystemExit("Herodium config root must be a mapping")
+
+if migrate_memory_hunter_whitelist(config):
+    print(
+        "[INFO] Migrated legacy Memory Hunter whitelist to hardened "
+        "executable identities."
+    )
 
 scheduler = config.setdefault("scheduler", {})
 scheduler["scan_via_systemd"] = True
