@@ -73,12 +73,15 @@ memory_scan:
   # If false, Memory Hunter will alert/log detections but will not terminate processes.
   # Also forced off automatically when clamav.threat_action is "alert".
   kill_infected_process: true
+  # Security boundary: only absolute executable paths are accepted.
+  # Each existing path must resolve to a root-owned regular executable that is
+  # not group/world writable; Memory Hunter pins its device/inode identity.
   whitelist:
-    - "chrome"
-    - "firefox"
-    - "code"
-    - "gnome-shell"
-    - "systemd"
+    - "/usr/lib/systemd/systemd"
+    - "/usr/lib/systemd/systemd-journald"
+    - "/usr/sbin/clamd"
+    - "/usr/bin/gnome-shell"
+    - "/usr/lib/xorg/Xorg"
 
 falco:
   # Optional real-time behavioral monitoring. Herodium only consumes alerts.
