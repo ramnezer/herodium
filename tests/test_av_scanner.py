@@ -4,9 +4,9 @@ import tempfile
 import threading
 import types
 import unittest
+from importlib import import_module
 from pathlib import Path
 from unittest.mock import Mock, patch
-
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 HERODIUM_ROOT = PROJECT_ROOT / "herodium"
@@ -20,13 +20,12 @@ if "pyclamd" not in sys.modules:
     pyclamd_stub.ClamdUnixSocket = Mock()
     sys.modules["pyclamd"] = pyclamd_stub
 
-import modules.av_scanner as av_scanner_module  # noqa: E402
-from modules.av_scanner import (  # noqa: E402
-    ClamAVScanner,
-    ScanReason,
-    ScanResult,
-    ScanStatus,
-)
+av_scanner_module = import_module("modules.av_scanner")
+
+ClamAVScanner = av_scanner_module.ClamAVScanner
+ScanReason = av_scanner_module.ScanReason
+ScanResult = av_scanner_module.ScanResult
+ScanStatus = av_scanner_module.ScanStatus
 
 
 class FakeClamd:
@@ -39,6 +38,20 @@ class FakeClamd:
         self.received.append(content)
         if self.error is not None:
             raise self.error
+        return self.response
+
+
+class ReplacingClamd:
+    def __init__(self, path, replacement, response):
+        self.path = Path(path)
+        self.replacement = replacement
+        self.response = response
+        self.received = []
+
+    def scan_stream(self, content):
+        self.received.append(content)
+        self.path.unlink()
+        self.path.write_bytes(self.replacement)
         return self.response
 
 
@@ -167,6 +180,101 @@ class ClamAVScanContractTests(unittest.TestCase):
         self.assertEqual(result.status, ScanStatus.INFECTED)
         self.assertEqual(result.threat_name, "Test.Signature")
         scanner._handle_threat.assert_called_once()
+
+    def test_delete_refuses_replacement_created_after_scanned_bytes_are_read(self):
+        with tempfile.TemporaryDirectory() as temp_root:
+            root = Path(temp_root)
+            source = root / "infected.bin"
+            source.write_bytes(b"original infected content")
+            clamd = ReplacingClamd(
+                source,
+                b"replacement benign content",
+                {"stream": ("FOUND", "Test.Signature")},
+            )
+            scanner = self._scanner(clamd)
+            scanner.action_policy = "delete"
+            scanner._handle_threat = ClamAVScanner._handle_threat.__get__(scanner)
+
+            result = scanner.scan_file(source)
+
+            self.assertEqual(result.status, ScanStatus.INFECTED)
+            self.assertEqual(clamd.received, [b"original infected content"])
+            self.assertEqual(source.read_bytes(), b"replacement benign content")
+            scanner.notifier.send_notification.assert_not_called()
+            self.logger.error.assert_called_with(
+                "Delete refused because source identity changed after scan: "
+                f"{source}"
+            )
+
+    def test_quarantine_refuses_replacement_created_after_scanned_bytes_are_read(self):
+        with tempfile.TemporaryDirectory() as temp_root:
+            root = Path(temp_root)
+            source = root / "infected.bin"
+            quarantine = root / "quarantine"
+            source.write_bytes(b"original infected content")
+            clamd = ReplacingClamd(
+                source,
+                b"replacement benign content",
+                {"stream": ("FOUND", "Test.Signature")},
+            )
+            scanner = self._scanner(clamd)
+            scanner.action_policy = "quarantine"
+            scanner.quarantine_dir = str(quarantine)
+            scanner._handle_threat = ClamAVScanner._handle_threat.__get__(scanner)
+
+            result = scanner.scan_file(source)
+
+            self.assertEqual(result.status, ScanStatus.INFECTED)
+            self.assertEqual(clamd.received, [b"original infected content"])
+            self.assertEqual(source.read_bytes(), b"replacement benign content")
+            self.assertFalse(quarantine.exists())
+            scanner.notifier.send_notification.assert_not_called()
+            self.logger.error.assert_called_with(
+                "Quarantine refused because source identity changed after scan: "
+                f"{source}"
+            )
+
+    def test_delete_removes_same_file_identity_that_was_scanned(self):
+        clamd = FakeClamd(response={"stream": ("FOUND", "Test.Signature")})
+        scanner = self._scanner(clamd)
+        scanner.action_policy = "delete"
+        scanner._handle_threat = ClamAVScanner._handle_threat.__get__(scanner)
+
+        with tempfile.TemporaryDirectory() as temp_root:
+            source = Path(temp_root) / "infected.bin"
+            source.write_bytes(b"infected content")
+
+            result = scanner.scan_file(source)
+
+            self.assertEqual(result.status, ScanStatus.INFECTED)
+            self.assertFalse(source.exists())
+            scanner.notifier.send_notification.assert_called_once()
+
+    def test_quarantine_removes_same_file_identity_that_was_scanned(self):
+        clamd = FakeClamd(response={"stream": ("FOUND", "Test.Signature")})
+        scanner = self._scanner(clamd)
+        scanner.action_policy = "quarantine"
+        scanner._handle_threat = ClamAVScanner._handle_threat.__get__(scanner)
+
+        with tempfile.TemporaryDirectory() as temp_root:
+            root = Path(temp_root)
+            source = root / "infected.bin"
+            quarantine = root / "quarantine"
+            source.write_bytes(b"infected content")
+            scanner.quarantine_dir = str(quarantine)
+
+            with (
+                patch.object(av_scanner_module.os, "chown"),
+                patch.object(av_scanner_module.os, "fchown"),
+            ):
+                result = scanner.scan_file(source)
+
+            self.assertEqual(result.status, ScanStatus.INFECTED)
+            self.assertFalse(source.exists())
+            quarantined = list(quarantine.iterdir())
+            self.assertEqual(len(quarantined), 1)
+            self.assertEqual(quarantined[0].read_bytes(), b"infected content")
+            scanner.notifier.send_notification.assert_called_once()
 
     def test_missing_file_returns_skipped(self):
         scanner = self._scanner(FakeClamd())
