@@ -1,4 +1,5 @@
 import os
+import stat
 
 import psutil
 
@@ -17,35 +18,13 @@ class MemoryHunter:
             True
         )
 
-        self.whitelist_names = set()
-        self.whitelist_paths = set()
+        self.whitelist_identities = {}
 
         for item in raw_whitelist:
             value = str(item).strip()
             if not value:
                 continue
-
-            if value.startswith('/'):
-                self.whitelist_paths.add(os.path.realpath(value))
-            else:
-                self.whitelist_names.add(value)
-
-        # Default safe whitelist entries
-        self.whitelist_names.update({
-            "chrome",
-            "firefox",
-            "code",
-            "gnome-shell",
-            "clamd",
-            "systemd",
-            "init",
-            "systemd-journald",
-        })
-
-        self.whitelist_paths.update({
-            os.path.realpath("/usr/bin/gnome-shell"),
-            os.path.realpath("/usr/bin/Xorg"),
-        })
+            self._register_whitelist_path(value)
 
         self.scanned_cache = {}
 
@@ -63,27 +42,97 @@ class MemoryHunter:
                 return False
         return default
 
-    def _is_whitelisted_process(self, name, exe_path):
-        """
-        Exact-match whitelist logic only.
-        Avoid substring matching to prevent false negatives.
-        """
+    def _trusted_executable_identity(self, path):
+        """Return a stable identity for a trusted root-owned executable."""
         try:
-            if name and name in self.whitelist_names:
-                return True
+            metadata = os.stat(path, follow_symlinks=False)
+        except OSError:
+            return None
 
-            if exe_path:
-                real_exe = os.path.realpath(exe_path)
+        if not stat.S_ISREG(metadata.st_mode):
+            return None
+        if metadata.st_uid != 0:
+            return None
+        if metadata.st_mode & 0o022:
+            return None
+        if not metadata.st_mode & 0o111:
+            return None
 
-                if real_exe in self.whitelist_paths:
-                    return True
+        return (metadata.st_dev, metadata.st_ino)
 
-                if os.path.basename(real_exe) in self.whitelist_names:
-                    return True
+    def _register_whitelist_path(self, value):
+        """Register one absolute executable path using canonical file identity."""
+        if not os.path.isabs(value):
+            self.logger.warning(
+                "Ignoring unsafe Memory Hunter whitelist entry %r: "
+                "absolute executable path required",
+                value,
+            )
+            return
 
+        real_path = os.path.realpath(value)
+        identity = self._trusted_executable_identity(real_path)
+        if identity is None:
+            if os.path.exists(real_path):
+                self.logger.warning(
+                    "Ignoring untrusted Memory Hunter whitelist path: %s",
+                    real_path,
+                )
+            else:
+                self.logger.debug(
+                    "Memory Hunter whitelist path is unavailable: %s",
+                    real_path,
+                )
+            return
+
+        self.whitelist_identities[real_path] = identity
+
+    def _is_whitelisted_process(self, pid, exe_path):
+        """Whitelist only the exact trusted executable object for this process."""
+        try:
+            if not exe_path or not os.path.isabs(exe_path):
+                return False
+
+            real_exe = os.path.realpath(exe_path)
+            expected_identity = self.whitelist_identities.get(real_exe)
+            if expected_identity is None:
+                return False
+
+            current_identity = self._trusted_executable_identity(real_exe)
+            if current_identity != expected_identity:
+                return False
+
+            process_metadata = os.stat(f"/proc/{pid}/exe")
+            process_identity = (
+                process_metadata.st_dev,
+                process_metadata.st_ino,
+            )
+            return process_identity == expected_identity
+        except (OSError, TypeError, ValueError):
             return False
-        except Exception:
-            return False
+
+    def _resolve_command_file_argument(self, arg, cwd):
+        """Resolve a command-line file argument without guessing process context."""
+        if not isinstance(arg, str) or not arg or "\x00" in arg:
+            return None
+        if arg.startswith("-"):
+            return None
+
+        try:
+            if os.path.isabs(arg):
+                candidate = arg
+            else:
+                if not cwd or not os.path.isabs(cwd):
+                    return None
+                candidate = os.path.join(cwd, arg)
+
+            real_candidate = os.path.realpath(candidate)
+            if os.path.isfile(real_candidate):
+                return real_candidate
+        except (OSError, TypeError, ValueError):
+            return None
+
+        return None
 
     def flash_scan(self):
         """Smart memory scan: checks EXE binary and command-line file arguments."""
@@ -93,20 +142,21 @@ class MemoryHunter:
         iteration_completed = True
 
         try:
-            attrs = ['pid', 'name', 'exe', 'cmdline', 'create_time']
+            attrs = ['pid', 'name', 'exe', 'cmdline', 'create_time', 'cwd']
             for proc in psutil.process_iter(attrs):
                 try:
                     pinfo = proc.info
                     pid = pinfo['pid']
                     exe_path = pinfo['exe']
                     cmdline = pinfo['cmdline']
+                    cwd = pinfo['cwd']
                     start_time = pinfo['create_time']
                     name = pinfo['name']
 
                     current_pids.add(pid)
 
                     # 1. Initial filtering (whitelist)
-                    if self._is_whitelisted_process(name, exe_path):
+                    if self._is_whitelisted_process(pid, exe_path):
                         continue
 
                     # 2. Cache check
@@ -121,8 +171,12 @@ class MemoryHunter:
 
                     if cmdline:
                         for arg in cmdline[1:]:
-                            if arg.startswith('/') and os.path.isfile(arg):
-                                files_to_scan.add(arg)
+                            command_file = self._resolve_command_file_argument(
+                                arg,
+                                cwd,
+                            )
+                            if command_file is not None:
+                                files_to_scan.add(command_file)
 
                     # 4. Perform scan
                     infected = False
@@ -173,7 +227,9 @@ class MemoryHunter:
 
                 except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
                     continue
-        except Exception as e:
+        # Keep the long-running monitor alive if an unexpected psutil/runtime
+        # error escapes the per-process isolation boundary.
+        except Exception as e:  # noqa: BLE001
             iteration_completed = False
             self.logger.error(f"Memory Scan Loop Error: {e}")
 
@@ -198,11 +254,9 @@ class MemoryHunter:
                 return False
 
             action_policy = str(getattr(self.scanner, 'action_policy', '') or '').lower()
-            if action_policy == 'alert':
-                return False
-
-            return True
-        except Exception:
+            return action_policy != 'alert'
+        # This authorization gate must fail closed for malformed scanner state.
+        except Exception:  # noqa: BLE001
             return False
 
     def _kill_process(self, proc, reason_file, *, pid, name):
@@ -228,7 +282,9 @@ class MemoryHunter:
                 proc.kill()
         except (psutil.NoSuchProcess, psutil.AccessDenied) as e:
             self.logger.warning(f"Unable to terminate infected process: {e}")
-        except Exception as e:
+        # Process termination is best-effort; unexpected platform errors must
+        # not terminate the Memory Hunter worker.
+        except Exception as e:  # noqa: BLE001
             self.logger.error(f"Unexpected process termination error: {e}")
 
     def _cleanup_cache(self, current_pids_set):
